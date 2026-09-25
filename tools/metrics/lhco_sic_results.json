@@ -1,0 +1,30 @@
+{
+  "fine_tune_pretrain_s_lhco_ad_nsig2000_r1": {
+    "nsig": 2000,
+    "auc": 0.9281833224213374,
+    "max_sic": 15.362657285237377,
+    "n_background": 59502,
+    "n_signal": 65228
+  },
+  "fine_tune_pretrain_s_lhco_ad_nsig1000_r3": {
+    "nsig": 1000,
+    "auc": 0.8996912518050594,
+    "max_sic": 6.412748674004268,
+    "n_background": 59502,
+    "n_signal": 65228
+  },
+  "fine_tune_pretrain_s_lhco_ad_nsig500_test8": {
+    "nsig": 500,
+    "auc": 0.598280972458973,
+    "max_sic": 1.0012723620482336,
+    "n_background": 59502,
+    "n_signal": 65228
+  },
+  "fine_tune_pretrain_s_lhco_ad_nsig10000_test7": {
+    "nsig": 10000,
+    "auc": 0.976294001593822,
+    "max_sic": 60.01185364708041,
+    "n_background": 59502,
+    "n_signal": 65228
+  }
+}

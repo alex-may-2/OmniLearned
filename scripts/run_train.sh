@@ -69,7 +69,7 @@ if [ "$DISTILL" = 1 ]; then
         --distill
         --teacher-labels-dir "$TEACHER_DIR"
         --teacher-tag "$TEACHER_TAG"
-        --distill-alpha "$ALPHA" --distill-beta "$BETA" --distill-t "$DISTILL_T"
+        --distill-alpha "$ALPHA" --distill-beta "$BETA" --distill-T "$DISTILL_T"
     )
 fi
 [ "$WANDB" = 1 ] && args+=(--wandb)

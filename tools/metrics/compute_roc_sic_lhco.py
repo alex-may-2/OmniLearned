@@ -10,6 +10,7 @@ evaluate_lhco_eval_signal.sh run being scored.
 """
 
 import glob
+import json
 import os
 
 import matplotlib.pyplot as plt
@@ -19,11 +20,17 @@ from sklearn.metrics import roc_auc_score, roc_curve
 BLUE = "#2a78d6"
 GRAY = "#8a8a86"
 
+# Every run's (nsig, auc, max_sic) lands here, keyed by SAVE_TAG -- so
+# plot_lhco_sic_curve.py can build the nsig-vs-max-SIC curve from files
+# instead of pasted-in numbers (the original OmniLearn plot_lhco_sic.py's
+# approach, which goes stale the moment a model is re-evaluated).
+RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lhco_sic_results.json")
+
 # ============================================================
 SAVE_TAG_BASE = "fine_tune_pretrain_s"
 DATASET = "lhco_ad"
-NSIG = 1000
-DESCRIPT_TAG = "r1"
+NSIG = 10000
+DESCRIPT_TAG = "test7"
 QUANTIZATION = "none"
 
 # Drop FPR below this before max-SIC -- matches evaluate_classifiers_lhco.py
@@ -63,6 +70,27 @@ def max_sic(fpr, tpr, fpr_floor):
     if len(fpr) == 0:
         return float("nan"), 0
     return np.max(tpr / np.sqrt(fpr)), len(fpr)
+
+
+def save_result(save_tag, nsig, auc, sic, n_bkg, n_sig):
+    """Upsert this run's numbers into RESULTS_FILE, keyed by save_tag -- so
+    rerunning the same (nsig, descript_tag) overwrites cleanly instead of
+    accumulating duplicates, while different tags (different nsig, or
+    different seeds at the same nsig) all persist side by side."""
+    results = {}
+    if os.path.exists(RESULTS_FILE):
+        with open(RESULTS_FILE) as f:
+            results = json.load(f)
+    results[save_tag] = {
+        "nsig": nsig,
+        "auc": auc,
+        "max_sic": sic,
+        "n_background": n_bkg,
+        "n_signal": n_sig,
+    }
+    with open(RESULTS_FILE, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved result to {RESULTS_FILE}")
 
 
 def plot_roc_sic(fpr, tpr, auc, sic, outfile):
@@ -126,6 +154,7 @@ def main():
     print(f"Max SIC : {sic:.4f}  (FPR floor={FPR_FLOOR:g}, {n_surviving:,} ROC points survive)")
     print("Reference: a random classifier's max-SIC is 1.0, not 0.")
 
+    save_result(SAVE_TAG, NSIG, auc, sic, n_bkg, len(score_sig))
     plot_roc_sic(fpr, tpr, auc, sic, f"roc_sic_{SAVE_TAG}.png")
 
 

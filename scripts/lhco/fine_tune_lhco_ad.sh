@@ -43,7 +43,7 @@ SAVE_TAG_BASE=fine_tune_pretrain_s
 DATASET=lhco_ad
 PRETRAIN_TAG=pretrain_s
 SIZE=small
-NSIG=1000
+NSIG=2000
 DESCRIPT_TAG=r1
 # ============================================================
 
@@ -52,9 +52,8 @@ DIR="/pscratch/sd/m/mbenyas/LHCO"
 LHCO_PATH="/global/cfs/cdirs/m3246/mbenyas/OmniLearned_distillation/LHCO/nsig_${NSIG}"
 # LHCO_PATH="/global/cfs/cdirs/m3246/mbenyas/OmniLearned_distillation/LHCO/pure_test"
 
-# add back interaction terms
-# add back --pretrain-tag ${PRETRAIN_TAG} \
-# add back --fine-tune \
+# --iterations 1000 \
+
 cmd="omnilearned train \
   -o ${DIR} \
   --save-tag ${SAVE_TAG} \
@@ -63,11 +62,10 @@ cmd="omnilearned train \
   --dataset ${DATASET} --mode classifier --num-classes 2 \
   --path ${LHCO_PATH} \
   --size ${SIZE} \
-  --use-add --num-add 2 \
-  --conditional --num-cond 11 \
   --interaction --local-interaction \
-  --iterations 1000 \
-  --batch 16 --epoch 20 --wd 0.01 --lr 1e-5 --lr-factor 10.0 \
+  --conditional --num-cond 11 \
+  --use-add --num-add 2 \
+  --batch 16 --epoch 30 --wd 0.0 --lr 1e-6 --lr-factor 10.0 \
   --num-workers 4 \
   --wandb --resuming"
 
