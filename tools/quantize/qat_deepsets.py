@@ -67,7 +67,8 @@ def wrap_linears_qat(model, weight_bits, act_bits):
     name checks, save_checkpoint's model.module.body.state_dict() -- keeps
     working unmodified."""
     import brevitas.nn as qnn
-    from brevitas.quant.scaled_int import Int8ActPerTensorFloat, Int8WeightPerTensorFloat
+    # Power-of-2 scales: in firmware each scale is a bit shift, not a multiplier.
+    from brevitas.quant import Int8ActPerTensorFixedPoint, Int8WeightPerTensorFixedPoint
 
     targets = []
     for module in model.modules():
@@ -80,9 +81,9 @@ def wrap_linears_qat(model, weight_bits, act_bits):
             child.in_features,
             child.out_features,
             bias=child.bias is not None,
-            weight_quant=Int8WeightPerTensorFloat,
+            weight_quant=Int8WeightPerTensorFixedPoint,
             weight_bit_width=weight_bits,
-            input_quant=Int8ActPerTensorFloat,
+            input_quant=Int8ActPerTensorFixedPoint,
             input_bit_width=act_bits,
             return_quant_tensor=False,
         )
@@ -99,6 +100,8 @@ def main():
     ap.add_argument("--tag", required=True, help="base float checkpoint tag to warm-start from")
     ap.add_argument("--size", required=True, help="e.g. small, distillnet, tiny, micro, nano")
     ap.add_argument("--save-tag", required=True, help="new tag for the QAT checkpoint")
+    ap.add_argument("--init-dir", default=CHECKPOINT_DIR, help="dir holding the float --tag checkpoint")
+    ap.add_argument("--output-dir", default=CHECKPOINT_DIR, help="dir the QAT checkpoint is written to")
     ap.add_argument("--bits", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--warmup-epoch", type=float, default=1.0)
@@ -134,13 +137,39 @@ def main():
         **ds_params,
     )
     restore_checkpoint(
-        model, CHECKPOINT_DIR, get_checkpoint_name(args.tag), local_rank, is_main_node=is_master_node()
+        model, args.init_dir, get_checkpoint_name(args.tag), local_rank, is_main_node=is_master_node()
     )
     n_params = sum(p.numel() for p in model.parameters())
     if is_master_node():
         print(f"Warm-started from {args.tag} ({args.size}): {n_params:,} params")
 
     wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits)
+    # Saved into the checkpoint so the exact quantized network can be rebuilt for
+    # FPGA conversion. Quantizer types and bit widths are read back from the
+    # wrapped layers, so the record always matches what was trained.
+    qlin = next(m for m in model.modules() if type(m).__name__ == "QuantLinear")
+    model.arch_config = {
+        "arch": "deep-sets",
+        "size": args.size,
+        "dims": ds_params,
+        "input_dim": 4,
+        "num_classes": 2,
+        "act_layer": args.act_layer,
+        "fixed_n": args.deepsets_fixed_n,  # 0 = masked mean over valid particles
+        "num_interaction_layers": args.num_interaction_layers,
+        "interaction_k": args.interaction_k,
+        "energy_weighted_pool": False,
+        "pid": False,
+        "add_info": False,
+        "conditional": False,
+        "quant": {
+            "scope": "every nn.Linear: weight and input",
+            "weight_quant": qlin.weight_quant.quant_injector.__name__,
+            "act_quant": qlin.input_quant.quant_injector.__name__,
+            "weight_bits": int(qlin.weight_quant.bit_width()),
+            "act_bits": int(qlin.input_quant.bit_width()),
+        },
+    }
     if is_master_node():
         n_qlin = sum(1 for m in model.modules() if type(m).__name__ == "QuantLinear")
         print(f"Wrapped {n_qlin} nn.Linear layers as Brevitas QuantLinear ({args.bits}-bit)")
@@ -185,7 +214,7 @@ def main():
         mode="classifier",
         num_epochs=args.epochs,
         device=device,
-        output_dir=CHECKPOINT_DIR,
+        output_dir=args.output_dir,
         save_tag=args.save_tag,
         iterations_per_epoch=train_steps,
         ema_model=None,

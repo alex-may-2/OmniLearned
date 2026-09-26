@@ -736,6 +736,25 @@ def run(
             fixed_n=deepsets_fixed_n,
             **ds_params,
         )
+        # Saved into the checkpoint so the exact network can be rebuilt for FPGA
+        # conversion: activation and masking have no parameters, so they cannot
+        # be recovered from the weights.
+        model.arch_config = {
+            "arch": arch,
+            "size": model_size,
+            "dims": ds_params,
+            "input_dim": num_feat,
+            "num_classes": num_classes,
+            "act_layer": act_layer,
+            "fixed_n": deepsets_fixed_n,  # 0 = masked mean over valid particles
+            "num_interaction_layers": num_interaction_layers,
+            "interaction_k": interaction_k,
+            "energy_weighted_pool": energy_weighted_pool,
+            "pid": use_pid,
+            "add_info": use_add,
+            "conditional": conditional,
+            "quant": None,
+        }
     elif arch == "mlp":
         mlp_params = get_mlp_parameters(model_size)
         model = MLPStudent(

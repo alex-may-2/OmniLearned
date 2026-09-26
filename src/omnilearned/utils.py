@@ -432,6 +432,9 @@ def save_checkpoint(
     if hasattr(model.module, "cls_projector"):
         save_dict["cls_projector"] = model.module.cls_projector.state_dict()
 
+    if getattr(model.module, "arch_config", None) is not None:
+        save_dict["arch_config"] = model.module.arch_config
+
     if ema_model is not None:
         save_dict["ema_body"] = ema_model.body.state_dict()
         if model.module.generator is not None:

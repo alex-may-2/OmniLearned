@@ -89,6 +89,7 @@ def main():
     ap.add_argument("--batch", type=int, default=64,
                     help="batch size for the parity check / export dummy")
     ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--checkpoint-dir", default=CHECKPOINT_DIR, help="dir holding the QAT --tag checkpoint")
     ap.add_argument("--out-dir", default=OUT_DIR)
     args = ap.parse_args()
 
@@ -110,7 +111,7 @@ def main():
     print(f"Wrapped {n_qlin} nn.Linear layers as QuantLinear ({args.bits}-bit)")
 
     restore_checkpoint(
-        model, CHECKPOINT_DIR, get_checkpoint_name(args.tag), 0, is_main_node=True
+        model, args.checkpoint_dir, get_checkpoint_name(args.tag), 0, is_main_node=True
     )
     model.cpu().eval()
     n_params = sum(p.numel() for p in model.parameters())
@@ -136,7 +137,9 @@ def main():
     raw_path = os.path.join(args.out_dir, f"{args.tag}.onnx")
     from brevitas.export import export_qonnx
 
-    export_qonnx(wrapper, args=dummy, export_path=raw_path)
+    # dynamo=False: the TorchScript exporter keeps the pool as GlobalAveragePool;
+    # the dynamo one (torch>=2.9 default) decomposes it back to ReduceMean.
+    export_qonnx(wrapper, args=dummy, export_path=raw_path, dynamo=False)
     print(f"Wrote raw QONNX -> {raw_path}")
 
     from qonnx.core.modelwrapper import ModelWrapper
