@@ -1,0 +1,5 @@
+hls_prj/
+*.log
+*_h4ml.onnx
+*.onnx
+*.npz
