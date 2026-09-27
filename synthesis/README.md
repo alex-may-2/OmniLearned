@@ -5,7 +5,7 @@ export already happened on NERSC; this machine only converts and synthesizes.
 
 ## Input
 
-`qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx` (55 KB), copied from
+`onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx` (55 KB), copied from
 `/pscratch/sd/a/alexmay/omnilearned/qonnx/fpga/` on Perlmutter.
 
 - Model: DeepSets "distillnet" student (base_dim 32, phi 2 layers, rho 1 layer,
@@ -131,10 +131,12 @@ Xilinx toolchain: Vitis HLS (hls4ml `Vitis` backend) or Vivado HLS
    hls4ml.report.read_vivado_report("hls_prj/deepsets_distillnet_8bit")
    ```
 
-   Record: latency (cycles / ns), II, LUT, FF, DSP, BRAM vs the target part.
+   make sure to run only on rdsrv409 (has memory limit whihc may be problematic)
 
 5. Report back: which stage passed/failed, csim max |Δ|, argmax agreement and
    real-jet metrics vs the table above,
    synth report numbers, and any graph changes needed (those must be made on
    the PyTorch side in `src/omnilearned/network.py` and re-exported on NERSC
    with `tools/quantize/qat_deepsets_export_qonnx.py`).
+
+6. just start with this first run to see if it runs. If synthesis is taking longer than 1 hour kill it.

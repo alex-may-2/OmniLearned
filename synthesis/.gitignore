@@ -3,3 +3,5 @@ hls_prj/
 *_h4ml.onnx
 *.onnx
 *.npz
+convert_log.txt
+synth_log.txt
