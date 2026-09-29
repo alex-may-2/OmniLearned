@@ -78,6 +78,12 @@ python convert.py --io-type io_parallel --strategy Latency --pf 16 2>&1 | tee lo
 timeout 1h python convert.py --io-type io_parallel --strategy Latency --pf 16 --synth 2>&1 | tee logs/synth_parallel_pf16.txt
 ```
 
+Mini random-weight model for io_parallel sizing (see "Mini-model scan" below):
+
+```bash
+python mini_parallel.py --n 16 [--phi 64,32 --rho 32 --pf 16] [--synth]
+```
+
 Each option set writes its own project,
 `hls_prj/deepsets_distillnet_8bit_<io>_<strategy>_rf<N>[_pf<N>]`, so runs never
 overwrite each other (`hls_prj/` is not in git). The first run's project is kept
@@ -159,6 +165,49 @@ Ablation (9984 jets; "wide" = `fixed<48,20>` or 65536-entry 34-bit Tanh table):
 | both of the above                | 0.146     | 98.75% | 0.9186 | 0.9756 |
 | Tanh table only wide             | 0.157     | 98.77% | 0.9200 | 0.9754 |
 | everything wide                  | 0.042     | 99.68% | 0.9175 | 0.9755 |
+
+## io_parallel attempt (2026-09-28)
+
+Goal: a fully parallel design (all particles at once) for an L1-trigger-style 25 ns initiation interval.
+Note that 25 ns is the per-event II; L1 latency budgets are µs, and ~75-150 ns is realistic for a 7-layer net.
+
+- `convert.py --io-type io_parallel --strategy Latency --pf 16`: C-sim parity identical to io_stream, but
+  Vitis csynth hit the 1 h cap still in unroll/inline (110k instructions after compile/link).
+- PF gotcha: `ParallelizationFactor` must be set on `MatMul_<i>`; `MatmulConstToDense` overwrites any
+  `Dense_MatMul_<i>` config. PF only affects the 4 per-particle PointwiseConv1D layers, not elementwise layers.
+- Blocker: in io_parallel every elementwise layer runs on all 64x64 = 4096 values at once. hls4ml's io_parallel
+  `tanh` puts `#pragma HLS PIPELINE` at function level, so the 4096-entry float table init is unrolled (3 layers),
+  and 4096 parallel lookups into a 4096x18-bit table need ~7M LUT (or ~2000 BRAM copies per layer).
+
+The full-quant QAT plan (8-bit tanh input, 256-entry table, gamma folded, alpha as a power of 2) cuts the tanh cost
+to ~200k LUT. Still needed for io_parallel on top of it:
+
+1. **Smaller model.** 64 particles x phi (4-64-32-64-32) = ~410k MACs/jet. PF=16 needs ~100k parallel 8-bit
+   multipliers (~2M LUT, over the VU13P); the II is ~64/PF cycles, so PF=8 gives 40 ns (misses 25 ns).
+   Reaching II <= 5 cycles with a design that fits needs fewer particles (`--deepsets-fixed-n` 16-32) and/or a
+   narrower phi (see the mini-model scan below).
+2. **Tanh table storage.** HLS may replicate the ROM in BRAM for thousands of parallel reads; if csynth shows
+   that, patch the tanh template with `#pragma HLS BIND_STORAGE variable=tanh_table type=rom_1p impl=lutram`
+   (or build the table as logic).
+3. **Per-particle broadcast constants.** Any remaining ApplyAlpha (norm/scale) after a per-particle layer gets its
+   scale/bias broadcast to particles x channels (`n_filt = -1`, 4096 constants); collapse it to per-channel
+   (`n_filt` = channels) in `convert.py` if the new graph still has one.
+
+### Mini-model scan (`mini_parallel.py`)
+
+Random-weight QONNX DeepSets built in the script (8-bit power-of-2 Quant, ReLU, no biases/tanh, phi 4-64-32,
+rho 32-2, PF = n, io_parallel, Latency, 5 ns clock). C-sim is bit-exact vs qonnx. Independent of `convert.py`.
+
+| n | phi | PF | latency | II | LUT (device) |
+|---|---|---|---|---|---|
+| 16 | 64-32 | 4 | 165-175 ns | 40 ns | 743k (42%) |
+| 16 | 64-32 | 8 | 145-155 ns | 30 ns | 1.04M (60%) |
+| 32 | 64-32 | 8 | 205-215 ns | 60 ns | 1.39M (80%) |
+| 16 | 32-16 | 8 | 145-155 ns | 40 ns | 366k (21%) |
+
+DSP = 0 everywhere: all 8-bit products go into LUTs. The II comes from the pointwise conv layers (6-12 cycles
+unless PF = n). Fully parallel PF = n runs ran out of memory in Vitis (n16 phi 64-32) or were stopped for low
+memory (n16 phi 32-16); run one synth at a time. Full write-up: `io_parallel_report.md`.
 
 ## Next steps
 
