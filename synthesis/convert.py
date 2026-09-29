@@ -17,7 +17,9 @@ The monkeypatches below work around hls4ml bugs hit by this graph (hls4ml fork q
 """
 
 import argparse
+import copy
 import importlib
+import os
 
 import hls4ml
 import numpy as np
@@ -27,18 +29,18 @@ from hls4ml.model.layers import ApplyAlpha
 from hls4ml.model.optimizer.passes import move_scales
 from hls4ml.model.optimizer.passes.bn_fuse import FuseBatchNormalization
 from hls4ml.model.optimizer.passes.multi_dense import ReplaceMultidimensionalDenseWithConv
-from hls4ml.model.types import NamedType, TensorVariable, WeightVariable
+from hls4ml.model.types import FixedPrecisionType, NamedType, TensorVariable, WeightVariable
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.core.onnx_exec import execute_onnx
 from qonnx.transformation.gemm_to_matmul import GemmToMatMul
 from qonnx.util.cleanup import cleanup_model
 from sklearn.metrics import roc_auc_score, roc_curve
 
-ONNX = "onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx"
 PART = "xcvu13p-flga2577-2-e"
 BATCH = 64
 
 p = argparse.ArgumentParser()
+p.add_argument("--onnx", default="onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx")
 p.add_argument("--synth", action="store_true")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
@@ -47,7 +49,9 @@ p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"]
 p.add_argument("--pf", type=int, default=16)
 args = p.parse_args()
 
-OUT_DIR = f"hls_prj/deepsets_distillnet_8bit_{args.io_type}_{args.strategy.lower()}_rf{args.reuse_factor}"
+# The original 8-bit graph keeps its old project names; other graphs get a suffix from their file name.
+_tag = os.path.basename(args.onnx).removesuffix("_clean.onnx").split("_8bit")[-1]
+OUT_DIR = f"hls_prj/deepsets_distillnet_8bit{_tag}_{args.io_type}_{args.strategy.lower()}_rf{args.reuse_factor}"
 if args.io_type == "io_parallel":
     OUT_DIR += f"_pf{args.pf}"
 
@@ -150,7 +154,7 @@ def _parse_onnx_drop_pool_transpose(onnx_model):
 
 onnx_to_hls.parse_onnx_model = _parse_onnx_drop_pool_transpose
 
-model = ModelWrapper(ONNX)
+model = ModelWrapper(args.onnx)
 model = cleanup_model(model).transform(GemmToMatMul())
 model = cleanup_model(model)
 
@@ -158,14 +162,42 @@ cfg = hls4ml.utils.config_from_onnx_model(
     model, granularity="name", backend="Vitis", default_precision="fixed<16,6>", default_reuse_factor=args.reuse_factor
 )
 cfg["Model"]["Strategy"] = args.strategy
+
+
+def quant_type(node):
+    """ap_fixed type equal to a power-of-2-scale, zero-offset QONNX Quant (signed, not narrow)."""
+    scale = model.get_initializer(node.input[1]).item()
+    bits = int(model.get_initializer(node.input[3]).item())
+    return f"fixed<{bits},{bits + int(np.log2(scale))},RND_CONV,SAT>"
+
+
+def is_quant(node):
+    return node is not None and node.op_type == "Quant"
+
+
 for name, layer_cfg in cfg["LayerName"].items():
     layer_cfg["Strategy"] = args.strategy
-    if name.startswith("Tanh"):
+for t in model.get_nodes_by_op_type("Tanh"):
+    layer_cfg = cfg["LayerName"][t.name]
+    pre, post = model.find_producer(t.input[0]), model.find_consumer(t.output[0])
+    if is_quant(pre) and is_quant(post):
+        # Full-quant graph: the input is on a 2^-k grid and the output is re-quantized, so a LUT with one entry
+        # per input code (the table spans [-4, 4)) holding values already rounded to the output type is exact.
+        # Inputs beyond +-4 clamp to the end entries, which round to the same 8-bit output as the float tanh.
+        layer_cfg["TableSize"] = int(round(8 / model.get_initializer(pre.input[1]).item()))
+        layer_cfg["table_t"] = quant_type(post)
+        layer_cfg["Precision"]["result"] = quant_type(post)
+    else:
         # DynamicTanh: alpha ~8-10 amplifies LUT error of the previous tanh, so use a finer table / output
         # (table type must be set via "table_t"; Activation ignores Precision["table"] and keeps fixed<18,8>)
         layer_cfg["TableSize"] = 4096
         layer_cfg["table_t"] = "fixed<18,2>"
         layer_cfg["Precision"]["result"] = "fixed<16,2>"
+# The input feeds a Quant directly: use its type as the input type, so the host->fixed conversion is that Quant
+# (RND_CONV = round-half-even, like qonnx) instead of a fixed<16,6> truncation followed by a re-rounding.
+in_name = model.graph.input[0].name
+if is_quant(model.find_consumer(in_name)):
+    cfg["LayerName"][in_name]["Precision"]["result"] = quant_type(model.find_consumer(in_name))
 # Sum over 64 particles overflows the default fixed<16,6> accumulator (wraps by 64 -> mean off by exactly 1.0)
 cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = "fixed<32,19>"
 if args.io_type == "io_parallel":
@@ -174,15 +206,28 @@ if args.io_type == "io_parallel":
     for i in range(4):
         cfg["LayerName"][f"MatMul_{i}"]["ParallelizationFactor"] = args.pf
 
-hls_model = hls4ml.converters.convert_from_onnx_model(
-    model,
-    output_dir=OUT_DIR,
-    project_name="deepsets",
-    backend="Vitis",
-    io_type=args.io_type,
-    part=PART,
-    hls_config=cfg,
-)
+
+def convert(hls_cfg):
+    return hls4ml.converters.convert_from_onnx_model(
+        model,
+        output_dir=OUT_DIR,
+        project_name="deepsets",
+        backend="Vitis",
+        io_type=args.io_type,
+        part=PART,
+        hls_config=hls_cfg,
+    )
+
+
+# Exact mean pool: hls4ml does not infer GlobalPooling1D types, and accum / 64 keeps only the accumulator's
+# fractional bits. Convert once (no compile) to read the pooled tensor's inferred type, then give the
+# accumulator 6 more integer and fractional bits and the result 6 more fractional bits.
+pool_in = convert(copy.deepcopy(cfg)).graph["GlobalAveragePool_0"].get_input_variable().type.precision
+if isinstance(pool_in, FixedPrecisionType):
+    w, i = pool_in.width, pool_in.integer
+    cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = f"fixed<{w + 12},{i + 6}>"
+    cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = f"fixed<{w + 6},{i}>"
+hls_model = convert(cfg)
 hls_model.compile()
 
 

@@ -28,6 +28,10 @@ synthesizes. Graph changes must be made on the PyTorch side in
 - Verified on NERSC: onnx checker OK, IR version 9, every Quant 8-bit,
   qonnx-executor vs PyTorch max |Δ logit| = 0, 100% argmax agreement.
 
+Full-quant graph (bit-exact in HLS, see "Full-quant QAT" below):
+`qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant_clean.onnx` (same Perlmutter directory). Select it with
+`python convert.py --onnx <path>`.
+
 Real-jet test set: `top_test_10k_n64.npz` (also on Perlmutter next to the ONNX).
 `x`: float32 `[10000, 64, 4]`, first 10k jets of the top-tagging test split,
 same preprocessing as training. `y`: int `[10000]` labels (5080 / 4920).
@@ -60,6 +64,8 @@ python convert.py --synth    # also Vitis HLS csynth
 
 Options:
 
+- `--onnx PATH` (default: the original 8-bit graph in `onnx_graphs/`). Graphs other than the original get their
+  name suffix after `_8bit` in the project dir, e.g. `deepsets_distillnet_8bit_fullQuant_<io>_...`.
 - `--io-type {io_stream,io_parallel}` (default `io_stream`)
 - `--strategy {Resource,Latency}` (default `Resource`), applied to the model and every layer
 - `--reuse-factor N` (default 1)
@@ -160,6 +166,54 @@ Ablation (9984 jets; "wide" = `fixed<48,20>` or 65536-entry 34-bit Tanh table):
 | Tanh table only wide             | 0.157     | 98.77% | 0.9200 | 0.9754 |
 | everything wide                  | 0.042     | 99.68% | 0.9175 | 0.9755 |
 
+## Full-quant QAT (2026-09-28)
+
+`tools/quantize/qat_deepsets.py --full-quant`, warm-started from the float
+`distill_top_deepsets_distillnet_fpga_a05_T4` with the same KD recipe as the first QAT
+(15 epochs, lr 5e-5, 1 GPU node, ~45 min). Export with `qat_deepsets_export_qonnx.py --full-quant`.
+Changes, which cover next steps 5 to 7 below:
+
+- DynamicTanh gamma folded into the next Linear's weight columns. This removes 3 per-channel `Mul`s,
+  two of them per-particle.
+- DynamicTanh becomes `tanh(Quant8(alpha_po2 * x))`: alpha rounded to a power of 2 with a
+  straight-through estimator (1, 8, 8), and an 8-bit power-of-2 `Quant` on the tanh input. The tanh
+  output goes straight into the next layer's input `Quant`. The embed norm's alpha rounding
+  (0.77 -> 1) is absorbed exactly into `embed.fc1`, since ReLU is positively homogeneous. Without
+  that, the warm start drops from 0.93 to 0.74 accuracy.
+- Biases quantized with `Int16Bias` (scale = input scale x weight scale, i.e. on the accumulator grid).
+
+Graph: 53 nodes (Quant x24, Mul x3 instead of x6). PyTorch vs qonnx max |Δ logit| = 0.
+
+`convert.py` now sets every non-inferred type from the graph:
+
+- Input type = the input `Quant`'s type (`fixed<8,4,RND_CONV,SAT>`, an 8-bit input port).
+- Tanh LUT with one entry per input code (`TableSize = 8 / scale`: 1024, 32 and 128 entries instead
+  of 4096). Its `table_t` and result are the output `Quant`'s type.
+- Pool accumulator and result widened by 6 fractional bits, read from a first no-compile conversion,
+  so the /64 is exact.
+
+The same script still converts the old graph (97.5% agreement, unchanged).
+
+C-sim, 9984 real jets, io_stream/Resource and io_parallel/Latency PF=16 give identical numbers:
+
+| metric           | qonnx  | HLS C-sim |
+|------------------|--------|-----------|
+| accuracy         | 0.9169 | 0.9169    |
+| AUC              | 0.9736 | 0.9736    |
+| 1/eB @ eS=0.5    | 153.9  | 153.9     |
+| argmax agreement | —      | 100%      |
+| max \|Δ logit\| | —      | 0 (bit-exact) |
+
+Relative to the first QAT graph (acc 0.9181, AUC 0.9755), the full-quant model loses about 0.002 AUC.
+It does not need wide HLS types to reach parity. Synthesis of the full-quant graph has not been run yet
+(rdsrv409). Resource savings are expected from:
+
+- 3 fewer multiplier layers.
+- Power-of-2 alpha, which is a shift.
+- Smaller 8-bit tanh tables.
+- An 8-bit input.
+- `fixed<8,*>` activations everywhere a `Quant` sits.
+
 ## Next steps
 
 Roughly in priority order.
@@ -179,6 +233,8 @@ Roughly in priority order.
    numbers predate the Tanh `table_t` fix).
 
 ### Retraining (NERSC side) for bit-exact HLS
+
+Done: see "Full-quant QAT" above.
 
 5. Quantize biases in Brevitas QAT (`bias_quant`, power-of-2 scale) so QONNX
    pins their type.

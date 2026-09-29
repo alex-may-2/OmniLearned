@@ -32,6 +32,7 @@ architecture (and its state_dict keys) match before restore, e.g.:
 """
 
 import argparse
+import math
 import os
 
 import torch
@@ -41,6 +42,7 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from pytorch_optimizer import Lion
 
 from omnilearned.dataloader import load_data
+from omnilearned.layers import DynamicTanh
 from omnilearned.network import DeepSets, ACT_LAYERS
 from omnilearned.train import train_model
 from omnilearned.utils import (
@@ -57,7 +59,64 @@ DATA_PATH = "/global/cfs/cdirs/m4567/www/"
 TEACHER_DIR_L = "/pscratch/sd/t/twamorka/omnilearned/teacher_logits/companion_fine_tune_top_l"
 
 
-def wrap_linears_qat(model, weight_bits, act_bits):
+def dyt_linear_pairs(model):
+    """(DynamicTanh, the Linear it feeds) for every DeepSets norm. Uses module
+    paths, so call it on the float model before wrapping."""
+    body, head = model.body, model.classifier
+    pairs = [(body.embed.norm, body.embed.fc2)]
+    pairs += [(n, blk.fc1) for n, blk in zip(body.phi_norms, body.phi_blocks)]
+    pairs += [(n, blk.fc1) for n, blk in zip(head.rho_norms, head.rho)]
+    return pairs
+
+
+@torch.no_grad()
+def fold_dyt_gamma(model):
+    """Fold each DynamicTanh's per-channel gamma into the input columns of the
+    Linear it feeds: W @ (gamma * t) == (W * gamma) @ t. Removes the gamma Mul
+    from the exported graph (one fewer float op for hls4ml, and fewer
+    multipliers). Float warm-start only; the full-quant wrap drops gamma."""
+    for norm, lin in dyt_linear_pairs(model):
+        lin.weight.mul_(norm.weight[None, :])
+        norm.weight.fill_(1.0)
+    # The embed norm sits after ReLU(fc1), and ReLU is positively homogeneous, so the
+    # po2 rounding of its alpha can be absorbed exactly into fc1. Without this,
+    # 0.77 -> 1 alone drops accuracy from 0.93 to 0.74. phi/rho norms see the
+    # residual stream, so their rounding (7.8, 9.6 -> 8) is left to QAT.
+    embed = model.body.embed
+    if isinstance(embed.act, nn.ReLU):
+        a = embed.norm.alpha
+        a_po2 = torch.pow(2.0, torch.round(torch.log2(a)))
+        embed.fc1.weight.mul_(a / a_po2)
+        embed.fc1.bias.mul_(a / a_po2)
+        a.copy_(a_po2)
+
+
+class QuantDynamicTanh(nn.Module):
+    """hls4ml-exact DynamicTanh: tanh(Quant8(alpha_po2 * x)), no gamma.
+
+    alpha is rounded to a power of 2 (straight-through in log2), so the Mul is a
+    bit shift. The tanh input is quantized to a power-of-2 grid, so a tanh LUT
+    with one entry per code (TableSize = 8 / scale) is exact; the tanh output
+    goes straight into the next QuantLinear's input quantizer."""
+
+    def __init__(self, alpha, act_bits):
+        super().__init__()
+        import brevitas.nn as qnn
+        from brevitas.quant import Int8ActPerTensorFixedPoint
+
+        self.alpha = nn.Parameter(alpha.detach().clone())
+        self.act_quant = qnn.QuantIdentity(
+            act_quant=Int8ActPerTensorFixedPoint, bit_width=act_bits, return_quant_tensor=False
+        )
+
+    def forward(self, x):
+        # log/pow, not log2/exp2: ONNX has no Exp2; FoldConstants folds this to a constant
+        log_a = torch.log(self.alpha) / math.log(2.0)
+        alpha = torch.pow(2.0, log_a + (torch.round(log_a) - log_a).detach())
+        return torch.tanh(self.act_quant(alpha * x))
+
+
+def wrap_linears_qat(model, weight_bits, act_bits, full_quant=False):
     """Replace every nn.Linear in `model` with a Brevitas QuantLinear in
     place, copying over the existing (already-trained) weight/bias so this
     is a warm start, not a random re-init. Submodule names/paths are
@@ -65,10 +124,21 @@ def wrap_linears_qat(model, weight_bits, act_bits):
     everything downstream that walks named_parameters() by path --
     no_weight_decay() matching, get_param_groups()'s "body.embed"/"norm"
     name checks, save_checkpoint's model.module.body.state_dict() -- keeps
-    working unmodified."""
+    working unmodified.
+
+    full_quant: also quantize biases (Int16Bias, on the accumulator grid) and
+    swap every DynamicTanh for QuantDynamicTanh (gamma dropped -- call
+    fold_dyt_gamma first when warm-starting from a float model). Every op
+    between Quant nodes is then exact in fixed point."""
     import brevitas.nn as qnn
     # Power-of-2 scales: in firmware each scale is a bit shift, not a multiplier.
-    from brevitas.quant import Int8ActPerTensorFixedPoint, Int8WeightPerTensorFixedPoint
+    from brevitas.quant import Int8ActPerTensorFixedPoint, Int8WeightPerTensorFixedPoint, Int16Bias
+
+    if full_quant:
+        for module in list(model.modules()):
+            for child_name, child in module.named_children():
+                if isinstance(child, DynamicTanh):
+                    setattr(module, child_name, QuantDynamicTanh(child.alpha, act_bits))
 
     targets = []
     for module in model.modules():
@@ -85,6 +155,7 @@ def wrap_linears_qat(model, weight_bits, act_bits):
             weight_bit_width=weight_bits,
             input_quant=Int8ActPerTensorFixedPoint,
             input_bit_width=act_bits,
+            bias_quant=Int16Bias if full_quant else None,
             return_quant_tensor=False,
         )
         qlin.weight.data.copy_(child.weight.data)
@@ -123,6 +194,8 @@ def main():
                     help="must match the float checkpoint's activation")
     ap.add_argument("--deepsets-fixed-n", type=int, default=0,
                     help="must match the float checkpoint's fixed-N/no-mask body (0 = masked-mean)")
+    ap.add_argument("--full-quant", action="store_true",
+                    help="also quantize biases and DynamicTanh (gamma folded, po2 alpha) for bit-exact hls4ml")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
@@ -143,7 +216,9 @@ def main():
     if is_master_node():
         print(f"Warm-started from {args.tag} ({args.size}): {n_params:,} params")
 
-    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits)
+    if args.full_quant:
+        fold_dyt_gamma(model)
+    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits, full_quant=args.full_quant)
     # Saved into the checkpoint so the exact quantized network can be rebuilt for
     # FPGA conversion. Quantizer types and bit widths are read back from the
     # wrapped layers, so the record always matches what was trained.
@@ -168,6 +243,7 @@ def main():
             "act_quant": qlin.input_quant.quant_injector.__name__,
             "weight_bits": int(qlin.weight_quant.bit_width()),
             "act_bits": int(qlin.input_quant.bit_width()),
+            "full_quant": args.full_quant,  # Int16Bias biases + QuantDynamicTanh (gamma folded, po2 alpha)
         },
     }
     if is_master_node():
