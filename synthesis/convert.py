@@ -1,10 +1,17 @@
 """Convert the QONNX DeepSets graph with hls4ml, check C-sim vs qonnx, optionally synthesize.
 
 Usage (from synthesis/, on rdsrv409):
+    source /sdf/group/atlas/sw/conda/etc/profile.d/conda.sh
     conda activate /u1/alexmay/conda/envs/omnilearned-hls
     source /afs/slac/g/reseng/xilinx/2024.1/Vitis_HLS/2024.1/settings64.sh   # only needed for --synth
-    python convert.py              # convert + csim smoke test + real-jet check
+    python convert.py              # io_stream + Resource: convert + csim smoke test + real-jet check
     python convert.py --synth      # also run Vitis HLS synthesis
+    # io_parallel, particles unrolled 16-wide (check csim parity first, then synth with a 1 h cap)
+    python convert.py --io-type io_parallel --strategy Latency --pf 16 2>&1 | tee logs/convert_parallel_pf16.txt
+    timeout 1h python convert.py --io-type io_parallel --strategy Latency --pf 16 --synth 2>&1 | tee logs/synth_parallel_pf16.txt
+
+Each option set writes its own project, hls_prj/deepsets_distillnet_8bit_<io>_<strategy>_rf<N>[_pf<N>], so runs never
+overwrite each other.
 
 The monkeypatches below work around hls4ml bugs hit by this graph (hls4ml fork qibin2020@1d85133).
 """
@@ -28,7 +35,6 @@ from qonnx.util.cleanup import cleanup_model
 from sklearn.metrics import roc_auc_score, roc_curve
 
 ONNX = "onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx"
-OUT_DIR = "hls_prj/deepsets_distillnet_8bit"
 PART = "xcvu13p-flga2577-2-e"
 BATCH = 64
 
@@ -36,7 +42,14 @@ p = argparse.ArgumentParser()
 p.add_argument("--synth", action="store_true")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
+p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
+# io_parallel only: particles processed in parallel by the per-particle layers (divisor of 64; 64 = fully unrolled)
+p.add_argument("--pf", type=int, default=16)
 args = p.parse_args()
+
+OUT_DIR = f"hls_prj/deepsets_distillnet_8bit_{args.io_type}_{args.strategy.lower()}_rf{args.reuse_factor}"
+if args.io_type == "io_parallel":
+    OUT_DIR += f"_pf{args.pf}"
 
 # hls4ml bug: Layer._validate_attributes wraps ApplyAlpha's scale/bias_precision in NamedType, and
 # ScaleDownAdd rebuilds ApplyAlpha from those attributes, which update_precision rejects. Unwrap it.
@@ -144,9 +157,9 @@ model = cleanup_model(model)
 cfg = hls4ml.utils.config_from_onnx_model(
     model, granularity="name", backend="Vitis", default_precision="fixed<16,6>", default_reuse_factor=args.reuse_factor
 )
-cfg["Model"]["Strategy"] = "Resource"
+cfg["Model"]["Strategy"] = args.strategy
 for name, layer_cfg in cfg["LayerName"].items():
-    layer_cfg["Strategy"] = "Resource"
+    layer_cfg["Strategy"] = args.strategy
     if name.startswith("Tanh"):
         # DynamicTanh: alpha ~8-10 amplifies LUT error of the previous tanh, so use a finer table / output
         # (table type must be set via "table_t"; Activation ignores Precision["table"] and keeps fixed<18,8>)
@@ -155,6 +168,11 @@ for name, layer_cfg in cfg["LayerName"].items():
         layer_cfg["Precision"]["result"] = "fixed<16,2>"
 # Sum over 64 particles overflows the default fixed<16,6> accumulator (wraps by 64 -> mean off by exactly 1.0)
 cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = "fixed<32,19>"
+if args.io_type == "io_parallel":
+    # Per-particle MatMul_0..3 become PointwiseConv1D "Dense_MatMul_<i>"; default PF=1 loops over the 64 particles.
+    # Set on MatMul_<i>: MatmulConstToDense copies that config over any "Dense_MatMul_<i>" entry.
+    for i in range(4):
+        cfg["LayerName"][f"MatMul_{i}"]["ParallelizationFactor"] = args.pf
 
 hls_model = hls4ml.converters.convert_from_onnx_model(
     model,
