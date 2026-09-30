@@ -81,8 +81,12 @@ timeout 1h python convert.py --io-type io_parallel --strategy Latency --pf 16 --
 Mini random-weight model for io_parallel sizing (see "Mini-model scan" below):
 
 ```bash
-python mini_parallel.py --n 16 [--phi 64,32 --rho 32 --pf 16] [--synth]
+python mini_parallel.py --n 16 [--phi 64,32 --rho 32 --pf 16] [--synth]         # ReLU only (first scan)
+python mini_parallel.py --full-quant --n 16 --phi 32,16 --rho 16 --pf 8           # + Int16 biases, quantized tanh
+python mini_parallel.py --distillnet --n 32 --dim 16 --pf 2 [--phi-blocks 1 --rho-blocks 1]  # real student topology
 ```
+
+Distillnet-topology synths need ~30 GB at n x dim = 512 and more than 55 GB at 1024. Run those alone.
 
 Each option set writes its own project,
 `hls_prj/deepsets_distillnet_8bit_<io>_<strategy>_rf<N>[_pf<N>]`, so runs never
@@ -208,6 +212,13 @@ rho 32-2, PF = n, io_parallel, Latency, 5 ns clock). C-sim is bit-exact vs qonnx
 DSP = 0 everywhere: all 8-bit products go into LUTs. The II comes from the pointwise conv layers (6-12 cycles
 unless PF = n). Fully parallel PF = n runs ran out of memory in Vitis (n16 phi 64-32) or were stopped for low
 memory (n16 phi 32-16); run one synth at a time. Full write-up: `io_parallel_report.md`.
+
+Full-quant follow-up (2026-09-29, `mini_parallel.py --full-quant / --distillnet`, `io_parallel_fullquant_report.md`):
+- The full-quant elements cost 13-19% more LUT and 7-8 more cycles than the ReLU-only mini (same II). They do not
+  free room for more particles.
+- In io_parallel, the elementwise layers and FIFOs scale as ~1.2k LUT x n x dim, whatever the PF.
+- The largest real-topology point that fits is dim 16 / n 32 / PF 2: 57% LUT, II 80 ns, 0.54 µs.
+- For 64 particles, use io_stream.
 
 ## Next steps
 
