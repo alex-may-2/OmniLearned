@@ -99,15 +99,21 @@ class QuantDynamicTanh(nn.Module):
     with one entry per code (TableSize = 8 / scale) is exact; the tanh output
     goes straight into the next QuantLinear's input quantizer."""
 
-    def __init__(self, alpha, act_bits):
+    def __init__(self, alpha, act_bits, in_max=0.0):
         super().__init__()
         import brevitas.nn as qnn
+        from brevitas.inject.enum import ScalingImplType
         from brevitas.quant import Int8ActPerTensorFixedPoint
 
+        quant = Int8ActPerTensorFixedPoint
+        if in_max:
+            # Fixed input range [-in_max, in_max) instead of a learned one. in_max = 4 matches the hls4ml tanh
+            # table span: 8-bit tanh(4) already rounds to the top output code, so clipping there costs nothing,
+            # and the resolution is 1/32 where a learned range can drift to 1/4.
+            quant = Int8ActPerTensorFixedPoint.let(scaling_impl_type=ScalingImplType.CONST, min_val=-in_max, max_val=in_max)
+
         self.alpha = nn.Parameter(alpha.detach().clone())
-        self.act_quant = qnn.QuantIdentity(
-            act_quant=Int8ActPerTensorFixedPoint, bit_width=act_bits, return_quant_tensor=False
-        )
+        self.act_quant = qnn.QuantIdentity(act_quant=quant, bit_width=act_bits, return_quant_tensor=False)
 
     def forward(self, x):
         # log/pow, not log2/exp2: ONNX has no Exp2; FoldConstants folds this to a constant
@@ -116,7 +122,7 @@ class QuantDynamicTanh(nn.Module):
         return torch.tanh(self.act_quant(alpha * x))
 
 
-def wrap_linears_qat(model, weight_bits, act_bits, full_quant=False):
+def wrap_linears_qat(model, weight_bits, act_bits, full_quant=False, tanh_in_max=0.0):
     """Replace every nn.Linear in `model` with a Brevitas QuantLinear in
     place, copying over the existing (already-trained) weight/bias so this
     is a warm start, not a random re-init. Submodule names/paths are
@@ -138,7 +144,7 @@ def wrap_linears_qat(model, weight_bits, act_bits, full_quant=False):
         for module in list(model.modules()):
             for child_name, child in module.named_children():
                 if isinstance(child, DynamicTanh):
-                    setattr(module, child_name, QuantDynamicTanh(child.alpha, act_bits))
+                    setattr(module, child_name, QuantDynamicTanh(child.alpha, act_bits, tanh_in_max))
 
     targets = []
     for module in model.modules():
@@ -196,6 +202,10 @@ def main():
                     help="must match the float checkpoint's fixed-N/no-mask body (0 = masked-mean)")
     ap.add_argument("--full-quant", action="store_true",
                     help="also quantize biases and DynamicTanh (gamma folded, po2 alpha) for bit-exact hls4ml")
+    ap.add_argument("--resume-qat", action="store_true",
+                    help="--tag is a QAT checkpoint (same --full-quant/--tanh-in-max): continue QAT from it")
+    ap.add_argument("--tanh-in-max", type=float, default=0.0,
+                    help="--full-quant: fixed tanh-input range [-x, x) (4 = hls4ml table span); 0 = learned")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
@@ -209,16 +219,21 @@ def main():
         fixed_n=args.deepsets_fixed_n,
         **ds_params,
     )
-    restore_checkpoint(
+    restore = lambda: restore_checkpoint(
         model, args.init_dir, get_checkpoint_name(args.tag), local_rank, is_main_node=is_master_node()
     )
+    if not args.resume_qat:
+        restore()
     n_params = sum(p.numel() for p in model.parameters())
     if is_master_node():
         print(f"Warm-started from {args.tag} ({args.size}): {n_params:,} params")
 
-    if args.full_quant:
+    if args.full_quant and not args.resume_qat:
         fold_dyt_gamma(model)
-    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits, full_quant=args.full_quant)
+    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits, full_quant=args.full_quant,
+                     tanh_in_max=args.tanh_in_max)
+    if args.resume_qat:
+        restore()  # --tag is a QAT checkpoint with this same wrapping: load it after wrapping
     # Saved into the checkpoint so the exact quantized network can be rebuilt for
     # FPGA conversion. Quantizer types and bit widths are read back from the
     # wrapped layers, so the record always matches what was trained.
@@ -244,6 +259,7 @@ def main():
             "weight_bits": int(qlin.weight_quant.bit_width()),
             "act_bits": int(qlin.input_quant.bit_width()),
             "full_quant": args.full_quant,  # Int16Bias biases + QuantDynamicTanh (gamma folded, po2 alpha)
+            "tanh_in_max": args.tanh_in_max,  # 0 = learned tanh-input range
         },
     }
     if is_master_node():

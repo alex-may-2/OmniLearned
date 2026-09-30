@@ -88,6 +88,7 @@ def main():
                     help="must match the QAT checkpoint's fixed-N/no-mask body (0 = masked-mean)")
     ap.add_argument("--full-quant", action="store_true",
                     help="must match QAT --full-quant (quantized biases + QuantDynamicTanh)")
+    ap.add_argument("--tanh-in-max", type=float, default=0.0, help="must match QAT --tanh-in-max")
     ap.add_argument("--batch", type=int, default=64,
                     help="batch size for the parity check / export dummy")
     ap.add_argument("--num-workers", type=int, default=2)
@@ -108,7 +109,8 @@ def main():
         **ds_params,
     )
 
-    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits, full_quant=args.full_quant)
+    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits, full_quant=args.full_quant,
+                     tanh_in_max=args.tanh_in_max)
     n_qlin = sum(1 for m in model.modules() if type(m).__name__ == "QuantLinear")
     print(f"Wrapped {n_qlin} nn.Linear layers as QuantLinear ({args.bits}-bit)")
 

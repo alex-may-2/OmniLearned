@@ -166,51 +166,76 @@ Ablation (9984 jets; "wide" = `fixed<48,20>` or 65536-entry 34-bit Tanh table):
 | Tanh table only wide             | 0.157     | 98.77% | 0.9200 | 0.9754 |
 | everything wide                  | 0.042     | 99.68% | 0.9175 | 0.9755 |
 
-## Full-quant QAT (2026-09-28)
+## Full-quant QAT (2026-09-28/29)
 
-`tools/quantize/qat_deepsets.py --full-quant`, warm-started from the float
-`distill_top_deepsets_distillnet_fpga_a05_T4` with the same KD recipe as the first QAT
-(15 epochs, lr 5e-5, 1 GPU node, ~45 min). Export with `qat_deepsets_export_qonnx.py --full-quant`.
-Changes, which cover next steps 5 to 7 below:
+`tools/quantize/qat_deepsets.py --full-quant --tanh-in-max 4`, warm-started from the float
+`distill_top_deepsets_distillnet_fpga_a05_T4` with the same KD recipe as the first QAT.
+Export with `qat_deepsets_export_qonnx.py --full-quant --tanh-in-max 4`.
+Model changes, which cover next steps 5 to 7 below:
 
 - DynamicTanh gamma folded into the next Linear's weight columns. This removes 3 per-channel `Mul`s,
   two of them per-particle.
-- DynamicTanh becomes `tanh(Quant8(alpha_po2 * x))`: alpha rounded to a power of 2 with a
-  straight-through estimator (1, 8, 8), and an 8-bit power-of-2 `Quant` on the tanh input. The tanh
-  output goes straight into the next layer's input `Quant`. The embed norm's alpha rounding
-  (0.77 -> 1) is absorbed exactly into `embed.fc1`, since ReLU is positively homogeneous. Without
-  that, the warm start drops from 0.93 to 0.74 accuracy.
+- DynamicTanh becomes `tanh(Quant8(alpha_po2 * x))`:
+  - alpha is rounded to a power of 2 with a straight-through estimator, so the Mul is a shift.
+  - The tanh input `Quant` has a fixed range [-4, 4), scale 1/32 (`--tanh-in-max 4`). Clipping at 4
+    costs nothing: 8-bit tanh(4) already rounds to the top output code.
+  - A learned range drifted to scale 1/4 on the residual-stream norms (only ~16 codes across the
+    steep part of tanh) and to 1/128 on the embed norm (a 1024-entry table with 256 entries used).
+    With the fixed range, every tanh table is 256 entries.
+  - The tanh output goes straight into the next layer's input `Quant`.
+  - The embed norm's alpha rounding is absorbed exactly into `embed.fc1`, since ReLU is positively
+    homogeneous. Without that, the warm start drops from 0.93 to 0.74 accuracy.
 - Biases quantized with `Int16Bias` (scale = input scale x weight scale, i.e. on the accumulator grid).
 
 Graph: 53 nodes (Quant x24, Mul x3 instead of x6). PyTorch vs qonnx max |Δ logit| = 0.
 
 `convert.py` now sets every non-inferred type from the graph:
 
-- Input type = the input `Quant`'s type (`fixed<8,4,RND_CONV,SAT>`, an 8-bit input port).
-- Tanh LUT with one entry per input code (`TableSize = 8 / scale`: 1024, 32 and 128 entries instead
-  of 4096). Its `table_t` and result are the output `Quant`'s type.
-- Pool accumulator and result widened by 6 fractional bits, read from a first no-compile conversion,
-  so the /64 is exact.
+- Input type = the input `Quant`'s type (`fixed<8,*,RND_CONV,SAT>`, an 8-bit input port).
+- Tanh LUT with one entry per input code (`TableSize = 8 / scale` = 256). Its `table_t` and result
+  are the output `Quant`'s type (`fixed<8,1,RND_CONV,SAT>`).
+- Pool accumulator and result widened by 6 fractional bits, so the /64 is exact.
+- Any ReLU not fused with a following `Quant` gets its input's type instead of the default
+  `fixed<16,6>`. This is hit when alpha != 1 puts a Mul between them.
 
-The same script still converts the old graph (97.5% agreement, unchanged).
+The pool and ReLU types are read from a first no-compile conversion. The same script still converts
+the old graph (97.5% agreement, unchanged).
 
-C-sim, 9984 real jets, io_stream/Resource and io_parallel/Latency PF=16 give identical numbers:
+QAT runs (1 GPU node each, ~250 s/epoch). All are bit-exact in HLS C-sim (100% argmax agreement,
+max |Δ logit| = 0, 9984 jets). All graphs are in the Perlmutter directory as
+`..._8bit_fullQuant_r<N>[_clean].onnx`, and checkpoints are in `/pscratch/sd/a/alexmay/omnilearned/checkpoints`
+(r1's checkpoint is the one without a suffix):
+
+| run | tanh-input range | schedule | acc | AUC | 1/eB @ eS=0.5 |
+|-----|------------------|----------|-----|-----|---------------|
+| float model (no quant) | — | — | 0.9212 | 0.9770 | — |
+| first QAT graph (`_8bit`, not bit-exact) | — | — | 0.9181 | 0.9755 | 169.3 |
+| r1 | learned | 15 ep, lr 5e-5 | 0.9169 | 0.9736 | 153.9 |
+| r2 | [-4, 4) | 15 ep, lr 5e-5 | 0.9142 | 0.9746 | 123.9 |
+| r3 | [-4, 4) | 30 ep, lr 1e-4 | 0.9185 | 0.9736 | 127.0 |
+| **r4 (final)** | [-4, 4) | r2 + 15 ep, lr 2e-5 (`--resume-qat`) | 0.9176 | 0.9745 | 127.0 |
+| r5 | [-4, 4) | r4 + 9 ep, lr 2e-5, KD alpha/beta 0.2/0.8 | 0.9183 | 0.9742 | 130.3 |
+
+r4 is copied to `qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant[_clean].onnx`. The fixed tanh
+range recovers about half of the AUC lost in r1 (0.9736 to 0.9745). The rest of the gap to the first QAT
+graph (0.001 AUC) did not close with longer training, a lower-lr continuation or more KD weight. At this
+level, r2/r4/r5 differences are within checkpoint-selection noise (val loss jumps by ~0.01 between epochs).
+1/eB rests on ~30 background jets (±19%).
+
+C-sim of the final graph, identical for io_stream/Resource and io_parallel/Latency PF=16:
 
 | metric           | qonnx  | HLS C-sim |
 |------------------|--------|-----------|
-| accuracy         | 0.9169 | 0.9169    |
-| AUC              | 0.9736 | 0.9736    |
-| 1/eB @ eS=0.5    | 153.9  | 153.9     |
+| accuracy         | 0.9176 | 0.9176    |
+| AUC              | 0.9745 | 0.9745    |
 | argmax agreement | —      | 100%      |
 | max \|Δ logit\| | —      | 0 (bit-exact) |
 
-Relative to the first QAT graph (acc 0.9181, AUC 0.9755), the full-quant model loses about 0.002 AUC.
-It does not need wide HLS types to reach parity. Synthesis of the full-quant graph has not been run yet
-(rdsrv409). Resource savings are expected from:
+Synthesis of the full-quant graph has not been run yet (rdsrv409). Resource savings are expected from:
 
 - 3 fewer multiplier layers.
 - Power-of-2 alpha, which is a shift.
-- Smaller 8-bit tanh tables.
+- Three 256 x 8-bit tanh tables instead of 4096 x 18-bit.
 - An 8-bit input.
 - `fixed<8,*>` activations everywhere a `Quant` sits.
 

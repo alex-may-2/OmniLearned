@@ -219,14 +219,23 @@ def convert(hls_cfg):
     )
 
 
-# Exact mean pool: hls4ml does not infer GlobalPooling1D types, and accum / 64 keeps only the accumulator's
-# fractional bits. Convert once (no compile) to read the pooled tensor's inferred type, then give the
-# accumulator 6 more integer and fractional bits and the result 6 more fractional bits.
-pool_in = convert(copy.deepcopy(cfg)).graph["GlobalAveragePool_0"].get_input_variable().type.precision
+# Types hls4ml does not infer, read from a first conversion (no compile):
+# - Exact mean pool: GlobalPooling1D is not inferred, and accum / 64 keeps only the accumulator's fractional bits.
+#   Give the accumulator 6 more integer and fractional bits and the result 6 more fractional bits.
+# - A ReLU not fused with a following Quant (e.g. a Mul by alpha != 1 in between) falls back to the default
+#   fixed<16,6> and truncates. ReLU is exact in its input's type.
+first = convert(copy.deepcopy(cfg)).graph
+pool_in = first["GlobalAveragePool_0"].get_input_variable().type.precision
 if isinstance(pool_in, FixedPrecisionType):
     w, i = pool_in.width, pool_in.integer
     cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = f"fixed<{w + 12},{i + 6}>"
     cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = f"fixed<{w + 6},{i}>"
+for relu in model.get_nodes_by_op_type("Relu"):
+    layer = first.get(relu.name)
+    if layer is not None and layer.get_output_variable().type.precision.rounding_mode.name == "TRN":
+        in_t = layer.get_input_variable().type.precision
+        if isinstance(in_t, FixedPrecisionType):
+            cfg["LayerName"][relu.name]["Precision"]["result"] = f"fixed<{in_t.width},{in_t.integer}>"
 hls_model = convert(cfg)
 hls_model.compile()
 
