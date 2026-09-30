@@ -27,11 +27,12 @@ Model and graph:
 - **Input `global_in`:** `[64, 64, 4]` = (batch, particles, features). Particles are the leading-pT 64
   slots of the 150-slot dataset, with no mask. The batch dim is fixed to 64 by the export dummy input.
 - **Output:** `[64, 2]` logits.
-- **Full-quant ops (53 nodes):** Quant x24, Add x6, Transpose x5, MatMul x4, Gemm x3, Mul x3, Relu x3,
+- **Full-quant ops (56 nodes):** Quant x27, Add x6, Transpose x5, MatMul x4, Gemm x3, Mul x3, Relu x3,
   Tanh x3, Flatten, GlobalAveragePool.
   - The mean pool is `Transpose` + `GlobalAveragePool` (not `ReduceMean`).
   - Every weight, bias (16-bit), MatMul/Gemm input and tanh input is `Quant`-ed, with power-of-2
-    scales.
+    scales. Inputs that follow a ReLU are unsigned.
+  - The residual stream (embed output, phi residual sum) and the pool output are 10-bit `Quant`s.
   - The only non-`Quant` ops are ReLU, the power-of-2 alpha `Mul`s, residual adds and the pool. All of
     them are exact in fixed point.
 - **Export check:** onnx checker OK, IR version 9, and qonnx-executor vs PyTorch max |Δ logit| = 0.
@@ -143,10 +144,10 @@ Config gotchas:
 
 ## Full-quant QAT (2026-09-28/29)
 
-Training: `tools/quantize/qat_deepsets.py --full-quant --tanh-in-max 4`, warm-started from the float
-`distill_top_deepsets_distillnet_fpga_a05_T4` with the same KD recipe as the first QAT.
-Export: `qat_deepsets_export_qonnx.py --full-quant --tanh-in-max 4`.
-`--resume-qat` continues from an existing full-quant QAT checkpoint.
+Training: `tools/quantize/qat_deepsets.py --full-quant --tanh-in-max 4 [--res-bits N --relu-uint]`,
+warm-started from the float `distill_top_deepsets_distillnet_fpga_a05_T4` with the same KD recipe as the
+first QAT. Export: `qat_deepsets_export_qonnx.py` with the same quantization flags (the checkpoint keys
+depend on them). `--resume-qat` continues from an existing full-quant QAT checkpoint.
 
 Model changes relative to the first QAT graph:
 
@@ -164,26 +165,40 @@ Model changes relative to the first QAT graph:
 - **Biases:** quantized with `Int16Bias` (scale = input scale x weight scale, i.e. on the accumulator
   grid).
 
-QAT runs used 1 GPU node each (~250 s/epoch). All are bit-exact in HLS C-sim (100% argmax agreement,
+Added in r6–r8 (2026-09-29), resumed from r4:
+
+- **`--res-bits N`:** a power-of-2 `QuantIdentity` on the embed output, after the phi residual add (the
+  pool input) and after the pool. Without it, hls4ml carries these at full accumulator width.
+- **`--relu-uint`:** `phi.fc2` and `rho.fc2` inputs follow a ReLU, so they use
+  `Uint8ActPerTensorFixedPoint` (one more bit of resolution at 8 bits).
+- `convert.py` maps an unsigned `Quant` to `ufixed`. No other HLS-side changes were needed.
+
+QAT runs used 1 GPU node each (~215–250 s/epoch). All are bit-exact in HLS C-sim (100% argmax agreement,
 max |Δ logit| = 0, 9984 jets).
 
 - Graphs: `..._8bit_fullQuant_r<N>[_clean].onnx` in the Perlmutter qonnx directory.
 - Checkpoints: `/pscratch/sd/a/alexmay/omnilearned/checkpoints`. r1's checkpoint is the one without a
   suffix.
 
-| run | tanh-input range | schedule | acc | AUC | 1/eB @ eS=0.5 |
-|-----|------------------|----------|-----|-----|---------------|
+| run | residual / pool bits | schedule | acc | AUC | 1/eB @ eS=0.5 |
+|-----|----------------------|----------|-----|-----|---------------|
 | float model (no quant) | — | — | 0.9212 | 0.9770 | — |
 | first QAT graph (`_8bit`, not bit-exact) | — | — | 0.9181 | 0.9755 | 169.3 |
-| r1 | learned | 15 ep, lr 5e-5 | 0.9169 | 0.9736 | 153.9 |
-| r2 | [-4, 4) | 15 ep, lr 5e-5 | 0.9142 | 0.9746 | 123.9 |
-| r3 | [-4, 4) | 30 ep, lr 1e-4 | 0.9185 | 0.9736 | 127.0 |
-| **r4 (current)** | [-4, 4) | r2 + 15 ep, lr 2e-5 (`--resume-qat`) | 0.9176 | 0.9745 | 127.0 |
-| r5 | [-4, 4) | r4 + 9 ep, lr 2e-5, KD alpha/beta 0.2/0.8 | 0.9183 | 0.9742 | 130.3 |
+| r1 (learned tanh range) | — | 15 ep, lr 5e-5 | 0.9169 | 0.9736 | 153.9 |
+| r2 | — | 15 ep, lr 5e-5 | 0.9142 | 0.9746 | 123.9 |
+| r3 | — | 30 ep, lr 1e-4 | 0.9185 | 0.9736 | 127.0 |
+| r4 | — | r2 + 15 ep, lr 2e-5 (`--resume-qat`) | 0.9176 | 0.9745 | 127.0 |
+| r5 | — | r4 + 9 ep, lr 2e-5, KD alpha/beta 0.2/0.8 | 0.9183 | 0.9742 | 130.3 |
+| r6 | 12, `--relu-uint` | r4 + 15 ep, lr 2e-5 | 0.9161 | 0.9744 | 127.0 |
+| **r7 (current)** | 10, `--relu-uint` | r4 + 15 ep, lr 2e-5 | 0.9173 | 0.9744 | 123.9 |
+| r8 | 8, `--relu-uint` | r4 + 15 ep, lr 2e-5 | 0.9144 | 0.9724 | 130.3 |
 
-r4 is copied to `..._8bit_fullQuant[_clean].onnx`.
+All runs except r1 use the fixed tanh-input range [-4, 4). r7 is copied to
+`..._8bit_fullQuant[_clean].onnx`; r4 is kept as `onnx_graphs/..._fullQuant_r4_clean.onnx` for comparison.
 
 - The fixed tanh range recovers about half of the AUC lost in r1 (0.9736 to 0.9745).
+- A 10-bit residual stream and pool cost nothing measurable (r7 vs r4); even untrained, r4 with 10-bit
+  quantizers inserted gives AUC 0.9745. 8 bits costs 0.002 AUC and QAT does not recover it.
 - The remaining 0.001 AUC gap to the first QAT graph did not close with longer training, a lower-lr
   continuation or more KD weight.
 - At this level, the r2/r4/r5 differences are within checkpoint-selection noise (val loss jumps by
@@ -195,8 +210,8 @@ C-sim of the current graph, identical for io_stream/Resource and io_parallel/Lat
 
 | metric           | qonnx  | HLS C-sim |
 |------------------|--------|-----------|
-| accuracy         | 0.9176 | 0.9176    |
-| AUC              | 0.9745 | 0.9745    |
+| accuracy         | 0.9173 | 0.9173    |
+| AUC              | 0.9744 | 0.9744    |
 | argmax agreement | —      | 100%      |
 | max \|Δ logit\| | —      | 0 (bit-exact) |
 
@@ -207,6 +222,9 @@ The full-quant graph has not been synthesized yet. Resource savings are expected
 - Three 256 x 8-bit tanh tables instead of 4096 x 18-bit.
 - An 8-bit input.
 - `fixed<8,*>` activations everywhere a `Quant` sits.
+- The residual stream and pool (r4 → r7, io_stream types): residual stored as 10-bit instead of
+  25-bit per particle, pool accumulator `fixed<22,10>` instead of `fixed<37,18>`, pool result 10-bit
+  instead of 31-bit, rho residual add 24-bit instead of 32-bit.
 
 ## First QAT graph (2026-09-26, baseline)
 
@@ -240,15 +258,10 @@ Roughly in priority order.
 
 ### Further quantization (NERSC side, needs QAT)
 
-3. **Quantize the residual stream and the pool.** These are the only wide types left: the residual sums
-   are 25-bit per particle, the pool accumulator is `fixed<37,18>` with a 31-bit result, and the rho
-   residual is wider still.
-   - Add a power-of-2 `QuantIdentity` (~10–12 bits) on the embed output and after the phi residual add
-     (the pool input), and optionally after the pool.
-   - Try 12 bits first, then 10, and check the AUC cost.
-4. **Unsigned input quantizers after ReLU.** The `phi.fc2` and `rho.fc2` inputs are signed 8-bit but
-   never negative. `Uint8ActPerTensorFixedPoint` gives double the resolution at 8 bits, or the same
-   resolution at 7 bits.
+3. **Narrower pre-requantization sums.** The residual `Add`s are still computed at the MatMul accumulator
+   width (24-bit) before the 10-bit `Quant`. An output quantizer on `phi.fc2` / `rho.fc2` would shrink
+   the adders; check whether HLS already trims them first.
+4. **7-bit unsigned inputs after ReLU** (same resolution as the old signed 8-bit).
 5. **Optional output quantizer** on the logits (now `fixed<22,8>`), if the output port width matters
    downstream.
 6. **Lower weight bit-widths** (e.g. 6-bit, or 4-bit where tolerated) for DSP/LUT savings. This is a

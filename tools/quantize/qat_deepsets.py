@@ -122,7 +122,37 @@ class QuantDynamicTanh(nn.Module):
         return torch.tanh(self.act_quant(alpha * x))
 
 
-def wrap_linears_qat(model, weight_bits, act_bits, full_quant=False, tanh_in_max=0.0):
+def quant_residual_stream(model, res_bits):
+    """Quantize the fixed-N DeepSets residual stream: the embed output, every phi residual sum (the last one is the
+    pool input) and the pool output, each with a power-of-2 QuantIdentity. Otherwise hls4ml carries these sums at
+    full accumulator width (25-bit per particle, a 37-bit pool accumulator). Adds body.res_quant and replaces the
+    body's fixed-N forward (network.py is left untouched)."""
+    import types
+
+    import brevitas.nn as qnn
+    from brevitas.quant import Int8ActPerTensorFixedPoint
+
+    body = model.body
+    assert body.fixed_n and not body.pid and not body.add_info and not body.conditional, "fixed-N plain body only"
+    body.res_quant = nn.ModuleList(  # embed out, each phi sum, pool out
+        qnn.QuantIdentity(act_quant=Int8ActPerTensorFixedPoint, bit_width=res_bits, return_quant_tensor=False)
+        for _ in range(len(body.phi_blocks) + 2)
+    )
+
+    def forward_fixed_n(self, x, cond=None, pid=None, add_info=None):
+        q = self.res_quant
+        if x.shape[1] > self.fixed_n:
+            x = x[:, : self.fixed_n, :]
+        h = q[0](self.embed(x))
+        for i, (norm, phi) in enumerate(zip(self.phi_norms, self.phi_blocks)):
+            h = q[i + 1](h + phi(norm(h)))
+        z = nn.functional.adaptive_avg_pool1d(h.transpose(1, 2), 1).flatten(1)
+        return q[-1](z)
+
+    body._forward_fixed_n = types.MethodType(forward_fixed_n, body)
+
+
+def wrap_linears_qat(model, weight_bits, act_bits, full_quant=False, tanh_in_max=0.0, res_bits=0, relu_uint=False):
     """Replace every nn.Linear in `model` with a Brevitas QuantLinear in
     place, copying over the existing (already-trained) weight/bias so this
     is a warm start, not a random re-init. Submodule names/paths are
@@ -135,10 +165,21 @@ def wrap_linears_qat(model, weight_bits, act_bits, full_quant=False, tanh_in_max
     full_quant: also quantize biases (Int16Bias, on the accumulator grid) and
     swap every DynamicTanh for QuantDynamicTanh (gamma dropped -- call
     fold_dyt_gamma first when warm-starting from a float model). Every op
-    between Quant nodes is then exact in fixed point."""
+    between Quant nodes is then exact in fixed point.
+
+    res_bits: also quantize the residual stream and pool (quant_residual_stream).
+    relu_uint: unsigned input quantizer for a Linear fed directly by a ReLU (MLP.fc2), one more bit of resolution."""
     import brevitas.nn as qnn
     # Power-of-2 scales: in firmware each scale is a bit shift, not a multiplier.
-    from brevitas.quant import Int8ActPerTensorFixedPoint, Int8WeightPerTensorFixedPoint, Int16Bias
+    from brevitas.quant import (
+        Int8ActPerTensorFixedPoint,
+        Int8WeightPerTensorFixedPoint,
+        Int16Bias,
+        Uint8ActPerTensorFixedPoint,
+    )
+
+    if res_bits:
+        quant_residual_stream(model, res_bits)
 
     if full_quant:
         for module in list(model.modules()):
@@ -153,13 +194,16 @@ def wrap_linears_qat(model, weight_bits, act_bits, full_quant=False, tanh_in_max
                 targets.append((module, child_name, child))
 
     for module, child_name, child in targets:
+        # MLP: fc1 -> act -> norm -> fc2; fc2 sees the ReLU output only when norm is Identity (not the embed MLP)
+        after_relu = (relu_uint and child_name == "fc2" and isinstance(getattr(module, "act", None), nn.ReLU)
+                      and isinstance(getattr(module, "norm", None), nn.Identity))
         qlin = qnn.QuantLinear(
             child.in_features,
             child.out_features,
             bias=child.bias is not None,
             weight_quant=Int8WeightPerTensorFixedPoint,
             weight_bit_width=weight_bits,
-            input_quant=Int8ActPerTensorFixedPoint,
+            input_quant=Uint8ActPerTensorFixedPoint if after_relu else Int8ActPerTensorFixedPoint,
             input_bit_width=act_bits,
             bias_quant=Int16Bias if full_quant else None,
             return_quant_tensor=False,
@@ -203,9 +247,13 @@ def main():
     ap.add_argument("--full-quant", action="store_true",
                     help="also quantize biases and DynamicTanh (gamma folded, po2 alpha) for bit-exact hls4ml")
     ap.add_argument("--resume-qat", action="store_true",
-                    help="--tag is a QAT checkpoint (same --full-quant/--tanh-in-max): continue QAT from it")
+                    help="--tag is a QAT checkpoint: continue QAT from it (new --res-bits quantizers start from runtime stats)")
     ap.add_argument("--tanh-in-max", type=float, default=0.0,
                     help="--full-quant: fixed tanh-input range [-x, x) (4 = hls4ml table span); 0 = learned")
+    ap.add_argument("--res-bits", type=int, default=0,
+                    help="quantize the residual stream and pool output to this many bits (0 = off)")
+    ap.add_argument("--relu-uint", action="store_true",
+                    help="unsigned input quantizer for Linears fed by a ReLU (phi/rho fc2)")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
@@ -231,7 +279,7 @@ def main():
     if args.full_quant and not args.resume_qat:
         fold_dyt_gamma(model)
     wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits, full_quant=args.full_quant,
-                     tanh_in_max=args.tanh_in_max)
+                     tanh_in_max=args.tanh_in_max, res_bits=args.res_bits, relu_uint=args.relu_uint)
     if args.resume_qat:
         restore()  # --tag is a QAT checkpoint with this same wrapping: load it after wrapping
     # Saved into the checkpoint so the exact quantized network can be rebuilt for
@@ -260,6 +308,8 @@ def main():
             "act_bits": int(qlin.input_quant.bit_width()),
             "full_quant": args.full_quant,  # Int16Bias biases + QuantDynamicTanh (gamma folded, po2 alpha)
             "tanh_in_max": args.tanh_in_max,  # 0 = learned tanh-input range
+            "res_bits": args.res_bits,  # residual stream + pool QuantIdentity bits (0 = off)
+            "relu_uint": args.relu_uint,  # unsigned input quant after ReLU
         },
     }
     if is_master_node():

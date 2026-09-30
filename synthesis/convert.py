@@ -166,10 +166,11 @@ cfg["Model"]["Strategy"] = args.strategy
 
 
 def quant_type(node):
-    """ap_fixed type equal to a power-of-2-scale, zero-offset QONNX Quant (signed, not narrow)."""
+    """ap_(u)fixed type equal to a power-of-2-scale, zero-offset, not narrow QONNX Quant."""
     scale = model.get_initializer(node.input[1]).item()
     bits = int(model.get_initializer(node.input[3]).item())
-    return f"fixed<{bits},{bits + int(np.log2(scale))},RND_CONV,SAT>"
+    signed = next((a.i for a in node.attribute if a.name == "signed"), 1)
+    return f"{'' if signed else 'u'}fixed<{bits},{bits + int(np.log2(scale))},RND_CONV,SAT>"
 
 
 def is_quant(node):
