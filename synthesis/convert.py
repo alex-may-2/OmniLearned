@@ -1,17 +1,18 @@
 """Convert the QONNX DeepSets graph with hls4ml, check C-sim vs qonnx, optionally synthesize.
 
-Usage (from synthesis/, on rdsrv409):
+Usage (from synthesis/; C-sim also runs on Perlmutter, --synth only on rdsrv409):
     source /sdf/group/atlas/sw/conda/etc/profile.d/conda.sh
     conda activate /u1/alexmay/conda/envs/omnilearned-hls
     source /afs/slac/g/reseng/xilinx/2024.1/Vitis_HLS/2024.1/settings64.sh   # only needed for --synth
-    python convert.py              # io_stream + Resource: convert + csim smoke test + real-jet check
+    python convert.py              # full-quant graph, io_stream + Resource: convert + csim smoke test + real-jet check
+    python convert.py --onnx onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx   # first QAT graph
     python convert.py --synth      # also run Vitis HLS synthesis
     # io_parallel, particles unrolled 16-wide (check csim parity first, then synth with a 1 h cap)
     python convert.py --io-type io_parallel --strategy Latency --pf 16 2>&1 | tee logs/convert_parallel_pf16.txt
     timeout 1h python convert.py --io-type io_parallel --strategy Latency --pf 16 --synth 2>&1 | tee logs/synth_parallel_pf16.txt
 
-Each option set writes its own project, hls_prj/deepsets_distillnet_8bit_<io>_<strategy>_rf<N>[_pf<N>], so runs never
-overwrite each other.
+Each graph + option set writes its own project, hls_prj/deepsets_distillnet_8bit[<graph suffix>]_<io>_<strategy>_rf<N>[_pf<N>],
+so runs never overwrite each other.
 
 The monkeypatches below work around hls4ml bugs hit by this graph (hls4ml fork qibin2020@1d85133).
 """
@@ -40,7 +41,7 @@ PART = "xcvu13p-flga2577-2-e"
 BATCH = 64
 
 p = argparse.ArgumentParser()
-p.add_argument("--onnx", default="onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx")
+p.add_argument("--onnx", default="onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant_clean.onnx")
 p.add_argument("--synth", action="store_true")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)

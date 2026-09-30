@@ -1,54 +1,63 @@
-# hls4ml conversion + synthesis (off-NERSC machine with Vitis/Vivado)
+# hls4ml conversion + synthesis
 
-Notes for the agent/person running the FPGA step. Training, QAT and QONNX
-export happen on NERSC; this machine (SLAC rdsrv409) only converts and
-synthesizes. Graph changes must be made on the PyTorch side in
-`src/omnilearned/network.py` and re-exported on NERSC with
-`tools/quantize/qat_deepsets_export_qonnx.py`.
+Notes for the agent or person running the FPGA step.
+
+- Training, QAT and QONNX export happen on NERSC (Perlmutter).
+- `convert.py` C-sim runs on Perlmutter or on SLAC rdsrv409.
+- Vitis HLS synthesis runs only on rdsrv409.
+
+Graph changes are made on the PyTorch side in `tools/quantize/qat_deepsets.py`, which does the Brevitas
+wrapping (`network.py` stays Brevitas-free). Re-export with `tools/quantize/qat_deepsets_export_qonnx.py`.
 
 ## Input
 
-`onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx` (55 KB), copied from
-`/pscratch/sd/a/alexmay/omnilearned/qonnx/fpga/` on Perlmutter.
+Copy the graphs into `onnx_graphs/` from `/pscratch/sd/a/alexmay/omnilearned/qonnx/fpga/` on Perlmutter:
 
-- Model: DeepSets "distillnet" student (base_dim 32, phi 2 layers, rho 1 layer,
-  ReLU, DynamicTanh norm), ~11k params, KD'd from `fine_tune_top_l`, then 8-bit
-  Brevitas QAT (power-of-2 scales, per-tensor fixed point).
-- Task: top-tagging, 2 logits.
-- Input `global_in`: `[64, 64, 4]` = (batch, particles, features). Particles are
-  the leading-pT 64 slots of the 150-slot dataset, no mask. Batch dim is fixed
-  to 64 from the export dummy input.
-- Output: `[64, 2]` logits.
-- Ops (46 nodes): Quant x14, Add x6, Mul x6, Transpose x5, MatMul x4, Gemm x3,
-  Relu x3, Tanh x3, Flatten, GlobalAveragePool. Mean pool is
-  `Transpose` + `GlobalAveragePool` (not `ReduceMean`).
-- Only weights (8-bit) and the inputs of each MatMul are `Quant`-ed. Biases,
-  DynamicTanh alpha/gamma, ReLU/Tanh outputs, residual adds and the pool are
-  float in the QONNX graph, so HLS must choose their fixed-point types.
-- Verified on NERSC: onnx checker OK, IR version 9, every Quant 8-bit,
-  qonnx-executor vs PyTorch max |Δ logit| = 0, 100% argmax agreement.
+- `qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant_clean.onnx`: **current graph**, the `convert.py`
+  default. It is bit-exact in HLS (see "Full-quant QAT").
+- `qat_top_deepsets_distillnet_fpga_a05_T4_8bit_clean.onnx`: the first QAT graph. Only weights and MatMul
+  inputs are quantized, and it reaches 97.5% HLS agreement. Kept for comparison (`--onnx`).
 
-Full-quant graph (bit-exact in HLS, see "Full-quant QAT" below):
-`qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant_clean.onnx` (same Perlmutter directory). Select it with
-`python convert.py --onnx <path>`.
+Model and graph:
 
-Real-jet test set: `top_test_10k_n64.npz` (also on Perlmutter next to the ONNX).
-`x`: float32 `[10000, 64, 4]`, first 10k jets of the top-tagging test split,
-same preprocessing as training. `y`: int `[10000]` labels (5080 / 4920).
-Evaluated in batches of 64 (9984 jets = 156 full batches).
+- **Model:** DeepSets "distillnet" student (base_dim 32, phi 2 layers, rho 1 layer, ReLU, DynamicTanh
+  norm), ~11k params. It is KD'd from `fine_tune_top_l`, then given 8-bit Brevitas QAT (power-of-2 scales,
+  per-tensor fixed point).
+- **Task:** top-tagging, 2 logits.
+- **Input `global_in`:** `[64, 64, 4]` = (batch, particles, features). Particles are the leading-pT 64
+  slots of the 150-slot dataset, with no mask. The batch dim is fixed to 64 by the export dummy input.
+- **Output:** `[64, 2]` logits.
+- **Full-quant ops (53 nodes):** Quant x24, Add x6, Transpose x5, MatMul x4, Gemm x3, Mul x3, Relu x3,
+  Tanh x3, Flatten, GlobalAveragePool.
+  - The mean pool is `Transpose` + `GlobalAveragePool` (not `ReduceMean`).
+  - Every weight, bias (16-bit), MatMul/Gemm input and tanh input is `Quant`-ed, with power-of-2
+    scales.
+  - The only non-`Quant` ops are ReLU, the power-of-2 alpha `Mul`s, residual adds and the pool. All of
+    them are exact in fixed point.
+- **Export check:** onnx checker OK, IR version 9, and qonnx-executor vs PyTorch max |Δ logit| = 0.
+
+Real-jet test set: `top_test_10k_n64.npz` (in this directory, and on Perlmutter next to the ONNX).
+
+- `x`: float32 `[10000, 64, 4]`, the first 10k jets of the top-tagging test split, with the same
+  preprocessing as training.
+- `y`: int `[10000]` labels (5080 / 4920).
+- Evaluated in batches of 64 (9984 jets = 156 full batches).
 
 ## Environment
 
-- Conda env: `/u1/alexmay/conda/envs/omnilearned-hls` (Python 3.11,
-  `qonnx==1.0.0`, `onnx==1.20.1`, `onnxruntime==1.30.0`,
-  `onnxoptimizer==0.4.2`, scikit-learn, hls4ml fork
-  `git+https://github.com/qibin2020/hls4ml.git@fix/onnx-frontend-shape-bugs`
-  at `1d85133`). onnx>=1.21 writes IR 14, which onnxruntime 1.30 rejects.
-  Stock hls4ml misreads rank-3 MatMul / Reshape shapes, hence the fork.
-- Vitis HLS 2024.1: `source /afs/slac/g/reseng/xilinx/2024.1/Vitis_HLS/2024.1/settings64.sh`
+- **rdsrv409:** conda env `/u1/alexmay/conda/envs/omnilearned-hls` (Python 3.11).
+  - Packages: `qonnx==1.0.0`, `onnx==1.20.1`, `onnxruntime==1.30.0`, `onnxoptimizer==0.4.2`,
+    scikit-learn, and the hls4ml fork
+    `git+https://github.com/qibin2020/hls4ml.git@fix/onnx-frontend-shape-bugs` at `1d85133`.
+  - Keep onnx < 1.21: newer versions write IR 14, which onnxruntime 1.30 rejects.
+  - The fork is needed because stock hls4ml misreads rank-3 MatMul / Reshape shapes.
+- **Perlmutter:** `/global/cfs/cdirs/m2616/alexm/conda/envs/omnilearned-fpga` has the same pins plus
+  Brevitas, torch and the same hls4ml fork. It can do QAT, export and `convert.py` C-sim (g++ only, no
+  `--synth`).
+- **Vitis HLS 2024.1:** `source /afs/slac/g/reseng/xilinx/2024.1/Vitis_HLS/2024.1/settings64.sh`
   (`/u1/alexmay/setup.sh` only sources Vivado).
-- Run synthesis only on rdsrv409 (memory limits elsewhere). Kill synthesis
-  if it runs longer than 1 hour.
+- Run synthesis only on rdsrv409, because of memory limits elsewhere. Kill synthesis if it runs longer
+  than 1 hour.
 
 ## Running
 
@@ -64,147 +73,103 @@ python convert.py --synth    # also Vitis HLS csynth
 
 Options:
 
-- `--onnx PATH` (default: the original 8-bit graph in `onnx_graphs/`). Graphs other than the original get their
-  name suffix after `_8bit` in the project dir, e.g. `deepsets_distillnet_8bit_fullQuant_<io>_...`.
-- `--io-type {io_stream,io_parallel}` (default `io_stream`)
-- `--strategy {Resource,Latency}` (default `Resource`), applied to the model and every layer
-- `--reuse-factor N` (default 1)
-- `--pf N` (default 16, `io_parallel` only): `ParallelizationFactor` of the four
-  per-particle PointwiseConv1D layers (`Dense_MatMul_0..3`, configured via
-  `MatMul_0..3`), i.e. how many of the
-  64 particles are processed in parallel. Must divide 64; 64 = fully unrolled
-  (~400k multipliers, will not fit the VU13P). Default PF=1 would loop over
-  particles and give no latency gain.
+- `--onnx PATH` (default `onnx_graphs/..._8bit_fullQuant_clean.onnx`).
+- `--io-type {io_stream,io_parallel}` (default `io_stream`).
+- `--strategy {Resource,Latency}` (default `Resource`), applied to the model and every layer.
+- `--reuse-factor N` (default 1).
+- `--pf N` (default 16, `io_parallel` only): `ParallelizationFactor` of the four per-particle
+  PointwiseConv1D layers (`Dense_MatMul_0..3`, configured via `MatMul_0..3`).
+  - This is how many of the 64 particles are processed in parallel. It must divide 64.
+  - 64 means fully unrolled (~400k multipliers, which will not fit the VU13P).
+  - PF=1 would loop over the particles and give no latency gain.
 
-io_parallel run (check C-sim parity against the qonnx line first, then synthesize
-with a 1 h cap):
+io_parallel run. Check C-sim parity against the qonnx line first, then synthesize with a 1 h cap:
 
 ```bash
-python convert.py --io-type io_parallel --strategy Latency --pf 16 2>&1 | tee logs/convert_parallel_pf16.txt
-timeout 1h python convert.py --io-type io_parallel --strategy Latency --pf 16 --synth 2>&1 | tee logs/synth_parallel_pf16.txt
+python convert.py --io-type io_parallel --strategy Latency --pf 16 2>&1 | tee logs/convert_fullQuant_parallel_pf16.txt
+timeout 1h python convert.py --io-type io_parallel --strategy Latency --pf 16 --synth 2>&1 | tee logs/synth_fullQuant_parallel_pf16.txt
 ```
 
-Each option set writes its own project,
-`hls_prj/deepsets_distillnet_8bit_<io>_<strategy>_rf<N>[_pf<N>]`, so runs never
-overwrite each other (`hls_prj/` is not in git). The first run's project is kept
-at `hls_prj/deepsets_distillnet_8bit`. Synthesis report:
-`<project>/deepsets_prj/solution1/syn/report/deepsets_csynth.rpt` (per-layer
-reports in the same directory); the full hls4ml config used is saved as
-`<project>/hls4ml_config.yml`. Logs go in `logs/`.
+Each graph and option set writes its own project,
+`hls_prj/deepsets_distillnet_8bit[<graph suffix>]_<io>_<strategy>_rf<N>[_pf<N>]`, so runs never overwrite
+each other. The graph suffix is the part of the file name after `_8bit`, e.g. `_fullQuant`.
 
-`convert.py` config: Vitis backend, part `xcvu13p-flga2577-2-e`, io type /
-strategy / reuse / PF from the options above (first run: `io_stream`, `Resource`), default `fixed<16,6>`, Tanh
-`TableSize 4096` / `table_t fixed<18,2>` / result `fixed<16,2>`, pool
-accumulator `fixed<32,19>`.
+- Synthesis report: `<project>/deepsets_prj/solution1/syn/report/deepsets_csynth.rpt`, with per-layer
+  reports in the same directory.
+- The full hls4ml config used is saved as `<project>/hls4ml_config.yml`.
+- `hls_prj/` and `logs/` are gitignored.
+
+### `convert.py` config
+
+- Vitis backend, part `xcvu13p-flga2577-2-e`. io type, strategy, reuse and PF come from the options above.
+- Default precision is `fixed<16,6>`. It is only a fallback: every type on the full-quant graph is set
+  from the graph or inferred by hls4ml.
+- **Input:** the type of the input `Quant` (`fixed<8,*,RND_CONV,SAT>`, an 8-bit input port). The host
+  conversion is then that Quant (round-half-even, like qonnx).
+- **Tanh fed by a `Quant` and feeding a `Quant`:**
+  - One LUT entry per input code: `TableSize = 8 / input scale`, which is 256 for scale 1/32.
+  - `table_t` and result are the output `Quant`'s type, which makes the LUT exact.
+  - Otherwise (the first QAT graph): `TableSize 4096`, `table_t fixed<18,2>`, result `fixed<16,2>`.
+- **Pool:** the accumulator and result get 6 more fractional bits than the pooled tensor, so the /64 is
+  exact. The accumulator also gets 6 more integer bits, so the 64-particle sum cannot overflow.
+- **ReLU not fused with a following `Quant`:** gets its input's type. hls4ml does not infer ReLU types,
+  and the `fixed<16,6>` default truncates. This happens when a power-of-2 alpha other than 1 sits between
+  them.
+- The pool and ReLU types are read from a first conversion (no compile), then the model is converted
+  again.
 
 ### hls4ml bugs patched in `convert.py`
 
-The graph does not convert correctly with the fork as-is. `convert.py`
-monkeypatches (each commented in the script):
+The graph does not convert correctly with the fork as-is. `convert.py` monkeypatches these (each is
+commented in the script):
 
-1. `ScaleDownAdd` rebuilds `ApplyAlpha` with `NamedType` precision attributes,
-   which `WeightVariable.update_precision` rejects (crash).
-2. `FuseBatchNormalization` multiplies a `[particles, n_out]` broadcast scale
-   into the `[n_in, n_out]` weight of a rank-3 Dense.
-3. `move_scales` passes copy the old node's output `TensorVariable` into the
-   new `ApplyAlpha`, leaving an untyped variable (crash).
-4. `ReplaceMultidimensionalDenseWithConv` rebuilds from the pre-fusion
-   `weight_data`/`bias_data` and drops the quantizers (all per-particle biases lost).
-5. `move_scales` passes push an `ApplyAlpha` below a consumer without checking
-   fan-out (the residual branch lost the `Add_1` bias).
-6. The `Transpose` before `GlobalAveragePool` is kept as a data reorder while the
-   pool is configured channels-last (pool averaged the wrong elements); the
-   Transpose is dropped.
+1. `ScaleDownAdd` rebuilds `ApplyAlpha` with `NamedType` precision attributes, which
+   `WeightVariable.update_precision` rejects (crash).
+2. `FuseBatchNormalization` multiplies a `[particles, n_out]` broadcast scale into the `[n_in, n_out]`
+   weight of a rank-3 Dense.
+3. `move_scales` passes copy the old node's output `TensorVariable` into the new `ApplyAlpha`, leaving an
+   untyped variable (crash).
+4. `ReplaceMultidimensionalDenseWithConv` rebuilds from the pre-fusion `weight_data`/`bias_data` and
+   drops the quantizers (all per-particle biases lost).
+5. `move_scales` passes push an `ApplyAlpha` below a consumer without checking fan-out (the residual
+   branch lost the `Add_1` bias).
+6. The `Transpose` before `GlobalAveragePool` is kept as a data reorder while the pool is configured
+   channels-last, so the pool averaged the wrong elements. The Transpose is dropped.
 
-Config gotchas: the default `fixed<16,6>` pool accumulator overflows on the
-64-particle sum (wraps, mean off by exactly 1.0); Tanh table precision must be
-set via layer-level `table_t` (`Precision["table"]` is silently ignored).
-These patches are worth reporting upstream.
+Config gotchas:
 
-## Status (first run, 2026-09-26)
-
-C-sim, 9984 real jets (current `convert.py`):
-
-| metric           | qonnx  | HLS C-sim |
-|------------------|--------|-----------|
-| accuracy         | 0.9181 | 0.9169    |
-| AUC              | 0.9755 | 0.9751    |
-| 1/eB @ eS=0.5    | 169.3  | 141.1     |
-| argmax agreement | —      | 97.5%     |
-| mean / max \|Δ logit\| | — | 0.26 / 1.94 |
-
-1/eB at eS=0.5 rests on ~29 background jets, so its statistical error is ~±19%;
-AUC and argmax agreement are the better parity measures.
-
-Vitis HLS csynth (xcvu13p-flga2577-2-e, 5 ns clock, ReuseFactor 1, ~4.5 min):
-latency 120 cycles = 0.6 µs, II 68 cycles (particles stream in), estimated
-clock 3.65 ns. Resources: BRAM_18K 628 (11%), DSP 1334 (10%), FF 124,650 (3%),
-LUT 339,799 (19%); 46% / 43% / 14% / 78% of one SLR. These are HLS estimates
-(no Vivado logic synthesis yet). This run used the old Tanh table type
-(`fixed<18,8>`); same width as now, so resources should barely change.
-
-### Source of the remaining HLS vs qonnx discrepancy
-
-No conversion bug remains; it is fixed-point precision on the tensors the
-QONNX graph leaves in float:
-
-- Biases, alpha/gamma constants, the input, `Relu_0` and pool outputs fall
-  back to `fixed<16,6,TRN>` (up to ~0.001 truncation error each).
-- Tanh is a lookup table (step 8/4096, floor indexing, saturates at |x| > 4),
-  never bit-exact to float tanh.
-- DynamicTanh multiplies these ~1e-3 errors by alpha ≈ 8 (`Mul_2`) and 9.85
-  (`Mul_4`), then by gamma up to 5.9, so they flip 8-bit `Quant` rounding.
-
-Ablation (9984 jets; "wide" = `fixed<48,20>` or 65536-entry 34-bit Tanh table):
-
-| variant                          | mean \|Δ\| | argmax | acc    | AUC    |
-|----------------------------------|-----------|--------|--------|--------|
-| baseline                         | 0.263     | 97.48% | 0.9169 | 0.9751 |
-| biases + alpha/gamma wide        | 0.208     | 98.16% | 0.9191 | 0.9755 |
-| input/ReLU/pool outputs wide     | 0.220     | 97.88% | 0.9179 | 0.9753 |
-| both of the above                | 0.146     | 98.75% | 0.9186 | 0.9756 |
-| Tanh table only wide             | 0.157     | 98.77% | 0.9200 | 0.9754 |
-| everything wide                  | 0.042     | 99.68% | 0.9175 | 0.9755 |
+- The Tanh table type must be set via layer-level `table_t`; `Precision["table"]` is silently ignored.
+- hls4ml infers no types for `GlobalPooling1D` or ReLU; see the config section above.
 
 ## Full-quant QAT (2026-09-28/29)
 
-`tools/quantize/qat_deepsets.py --full-quant --tanh-in-max 4`, warm-started from the float
+Training: `tools/quantize/qat_deepsets.py --full-quant --tanh-in-max 4`, warm-started from the float
 `distill_top_deepsets_distillnet_fpga_a05_T4` with the same KD recipe as the first QAT.
-Export with `qat_deepsets_export_qonnx.py --full-quant --tanh-in-max 4`.
-Model changes, which cover next steps 5 to 7 below:
+Export: `qat_deepsets_export_qonnx.py --full-quant --tanh-in-max 4`.
+`--resume-qat` continues from an existing full-quant QAT checkpoint.
 
-- DynamicTanh gamma folded into the next Linear's weight columns. This removes 3 per-channel `Mul`s,
-  two of them per-particle.
-- DynamicTanh becomes `tanh(Quant8(alpha_po2 * x))`:
+Model changes relative to the first QAT graph:
+
+- **Gamma folded:** each DynamicTanh's gamma is folded into the next Linear's weight columns. This
+  removes 3 per-channel `Mul`s, two of them per-particle.
+- **DynamicTanh becomes `tanh(Quant8(alpha_po2 * x))`:**
   - alpha is rounded to a power of 2 with a straight-through estimator, so the Mul is a shift.
-  - The tanh input `Quant` has a fixed range [-4, 4), scale 1/32 (`--tanh-in-max 4`). Clipping at 4
-    costs nothing: 8-bit tanh(4) already rounds to the top output code.
-  - A learned range drifted to scale 1/4 on the residual-stream norms (only ~16 codes across the
-    steep part of tanh) and to 1/128 on the embed norm (a 1024-entry table with 256 entries used).
-    With the fixed range, every tanh table is 256 entries.
-  - The tanh output goes straight into the next layer's input `Quant`.
   - The embed norm's alpha rounding is absorbed exactly into `embed.fc1`, since ReLU is positively
     homogeneous. Without that, the warm start drops from 0.93 to 0.74 accuracy.
-- Biases quantized with `Int16Bias` (scale = input scale x weight scale, i.e. on the accumulator grid).
+  - The tanh input `Quant` has a fixed range [-4, 4) with scale 1/32. Clipping at 4 costs nothing,
+    because 8-bit tanh(4) already rounds to the top output code.
+  - A learned range drifted to scale 1/4 on the residual-stream norms (only ~16 codes across the steep
+    part of tanh) and to 1/128 on the embed norm (a 1024-entry table with 256 entries used).
+  - The tanh output goes straight into the next layer's input `Quant`.
+- **Biases:** quantized with `Int16Bias` (scale = input scale x weight scale, i.e. on the accumulator
+  grid).
 
-Graph: 53 nodes (Quant x24, Mul x3 instead of x6). PyTorch vs qonnx max |Δ logit| = 0.
+QAT runs used 1 GPU node each (~250 s/epoch). All are bit-exact in HLS C-sim (100% argmax agreement,
+max |Δ logit| = 0, 9984 jets).
 
-`convert.py` now sets every non-inferred type from the graph:
-
-- Input type = the input `Quant`'s type (`fixed<8,*,RND_CONV,SAT>`, an 8-bit input port).
-- Tanh LUT with one entry per input code (`TableSize = 8 / scale` = 256). Its `table_t` and result
-  are the output `Quant`'s type (`fixed<8,1,RND_CONV,SAT>`).
-- Pool accumulator and result widened by 6 fractional bits, so the /64 is exact.
-- Any ReLU not fused with a following `Quant` gets its input's type instead of the default
-  `fixed<16,6>`. This is hit when alpha != 1 puts a Mul between them.
-
-The pool and ReLU types are read from a first no-compile conversion. The same script still converts
-the old graph (97.5% agreement, unchanged).
-
-QAT runs (1 GPU node each, ~250 s/epoch). All are bit-exact in HLS C-sim (100% argmax agreement,
-max |Δ logit| = 0, 9984 jets). All graphs are in the Perlmutter directory as
-`..._8bit_fullQuant_r<N>[_clean].onnx`, and checkpoints are in `/pscratch/sd/a/alexmay/omnilearned/checkpoints`
-(r1's checkpoint is the one without a suffix):
+- Graphs: `..._8bit_fullQuant_r<N>[_clean].onnx` in the Perlmutter qonnx directory.
+- Checkpoints: `/pscratch/sd/a/alexmay/omnilearned/checkpoints`. r1's checkpoint is the one without a
+  suffix.
 
 | run | tanh-input range | schedule | acc | AUC | 1/eB @ eS=0.5 |
 |-----|------------------|----------|-----|-----|---------------|
@@ -213,16 +178,20 @@ max |Δ logit| = 0, 9984 jets). All graphs are in the Perlmutter directory as
 | r1 | learned | 15 ep, lr 5e-5 | 0.9169 | 0.9736 | 153.9 |
 | r2 | [-4, 4) | 15 ep, lr 5e-5 | 0.9142 | 0.9746 | 123.9 |
 | r3 | [-4, 4) | 30 ep, lr 1e-4 | 0.9185 | 0.9736 | 127.0 |
-| **r4 (final)** | [-4, 4) | r2 + 15 ep, lr 2e-5 (`--resume-qat`) | 0.9176 | 0.9745 | 127.0 |
+| **r4 (current)** | [-4, 4) | r2 + 15 ep, lr 2e-5 (`--resume-qat`) | 0.9176 | 0.9745 | 127.0 |
 | r5 | [-4, 4) | r4 + 9 ep, lr 2e-5, KD alpha/beta 0.2/0.8 | 0.9183 | 0.9742 | 130.3 |
 
-r4 is copied to `qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant[_clean].onnx`. The fixed tanh
-range recovers about half of the AUC lost in r1 (0.9736 to 0.9745). The rest of the gap to the first QAT
-graph (0.001 AUC) did not close with longer training, a lower-lr continuation or more KD weight. At this
-level, r2/r4/r5 differences are within checkpoint-selection noise (val loss jumps by ~0.01 between epochs).
-1/eB rests on ~30 background jets (±19%).
+r4 is copied to `..._8bit_fullQuant[_clean].onnx`.
 
-C-sim of the final graph, identical for io_stream/Resource and io_parallel/Latency PF=16:
+- The fixed tanh range recovers about half of the AUC lost in r1 (0.9736 to 0.9745).
+- The remaining 0.001 AUC gap to the first QAT graph did not close with longer training, a lower-lr
+  continuation or more KD weight.
+- At this level, the r2/r4/r5 differences are within checkpoint-selection noise (val loss jumps by
+  ~0.01 between epochs).
+- 1/eB at eS=0.5 rests on ~30 background jets, so its statistical error is ~±19%. AUC and argmax
+  agreement are the better measures.
+
+C-sim of the current graph, identical for io_stream/Resource and io_parallel/Latency PF=16:
 
 | metric           | qonnx  | HLS C-sim |
 |------------------|--------|-----------|
@@ -231,7 +200,7 @@ C-sim of the final graph, identical for io_stream/Resource and io_parallel/Laten
 | argmax agreement | —      | 100%      |
 | max \|Δ logit\| | —      | 0 (bit-exact) |
 
-Synthesis of the full-quant graph has not been run yet (rdsrv409). Resource savings are expected from:
+The full-quant graph has not been synthesized yet. Resource savings are expected from:
 
 - 3 fewer multiplier layers.
 - Power-of-2 alpha, which is a shift.
@@ -239,56 +208,63 @@ Synthesis of the full-quant graph has not been run yet (rdsrv409). Resource savi
 - An 8-bit input.
 - `fixed<8,*>` activations everywhere a `Quant` sits.
 
+## First QAT graph (2026-09-26, baseline)
+
+C-sim, 9984 jets: HLS agreement 97.5%, mean / max |Δ logit| 0.26 / 1.94, and HLS AUC 0.9751 vs qonnx
+0.9755. The mismatch came from the tensors this graph leaves in float (biases, alpha/gamma, the tanh LUT,
+the input and pool types). DynamicTanh's alpha ≈ 8–10 and gamma up to 5.9 amplified those errors enough
+to flip 8-bit `Quant` rounding. Widening every type to `fixed<48,20>` only reached 99.7%. This is what
+the full-quant QAT fixes.
+
+Vitis HLS csynth (xcvu13p-flga2577-2-e, 5 ns clock, io_stream, Resource, ReuseFactor 1, ~4.5 min):
+
+- Latency: 120 cycles = 0.6 µs.
+- II: 68 cycles (particles stream in).
+- Estimated clock: 3.65 ns.
+- Resources: BRAM_18K 628 (11%), DSP 1334 (10%), FF 124,650 (3%), LUT 339,799 (19%). That is
+  46% / 43% / 14% / 78% of one SLR.
+
+These are HLS estimates; no Vivado logic synthesis has been run yet. They are the baseline for the
+full-quant graph.
+
 ## Next steps
 
 Roughly in priority order.
 
-### Precision / parity (HLS side, no retraining)
+### Synthesis of the full-quant graph
 
-1. Give the non-`Quant` types a few more fractional bits instead of the
-   blanket `fixed<16,6>`: e.g. biases and alpha/gamma `fixed<18,4>` or wider,
-   ReLU/pool outputs matched to their real range. Use rounding (`RND`) instead
-   of truncation (`TRN`) on these types; truncation biases every value downward.
-2. Tanh: try a finer table and `table_t` with rounding, and check how much
-   the saturation at |x| > 4 matters (alpha ≈ 8 puts many inputs there).
-3. Use `hls4ml.model.profiling` on the real jets to size each type to its
-   actual range, then re-check parity. Target: AUC and argmax agreement match
-   the "both wide" rows at minimal extra bits.
-4. Re-run `convert.py --synth` after the precision changes (the current synth
-   numbers predate the Tanh `table_t` fix).
+1. On rdsrv409, run `convert.py --synth` on the full-quant graph (io_stream, and io_parallel PF=16 with
+   the 1 h cap). Compare against the baseline above.
+2. Run Vivado logic synthesis (`hls_model.build(..., vsynth=True)`) for real post-synthesis resource and
+   timing numbers instead of HLS estimates.
 
-### Retraining (NERSC side) for bit-exact HLS
+### Further quantization (NERSC side, needs QAT)
 
-Done: see "Full-quant QAT" above.
+3. **Quantize the residual stream and the pool.** These are the only wide types left: the residual sums
+   are 25-bit per particle, the pool accumulator is `fixed<37,18>` with a 31-bit result, and the rho
+   residual is wider still.
+   - Add a power-of-2 `QuantIdentity` (~10–12 bits) on the embed output and after the phi residual add
+     (the pool input), and optionally after the pool.
+   - Try 12 bits first, then 10, and check the AUC cost.
+4. **Unsigned input quantizers after ReLU.** The `phi.fc2` and `rho.fc2` inputs are signed 8-bit but
+   never negative. `Uint8ActPerTensorFixedPoint` gives double the resolution at 8 bits, or the same
+   resolution at 7 bits.
+5. **Optional output quantizer** on the logits (now `fixed<22,8>`), if the output port width matters
+   downstream.
+6. **Lower weight bit-widths** (e.g. 6-bit, or 4-bit where tolerated) for DSP/LUT savings. This is a
+   separate precision-vs-AUC scan.
 
-5. Quantize biases in Brevitas QAT (`bias_quant`, power-of-2 scale) so QONNX
-   pins their type.
-6. Quantize DynamicTanh: `QuantIdentity` on `alpha * x` (8-bit, power-of-2
-   scale, e.g. 1/32 covering [-4, 4)) and `qnn.QuantTanh` with a power-of-2
-   output quantizer (`Int8ActPerTensorFixedPoint`). Then set HLS
-   `TableSize = 8 / input_scale` (256 for scale 1/32) and `table_t` = the output
-   quant type with rounding, which makes the Tanh LUT exact. Quantize gamma or
-   fold it into the following `Quant` scale.
-7. With 5 and 6, every float op between `Quant` nodes is gone and HLS should
-   match qonnx bit-exactly (accumulators are already sized losslessly).
-   Re-export and re-run `convert.py`; check the patches still apply.
+### Resources / latency (HLS side)
 
-### Resources / latency
-
-8. Raise `ReuseFactor` (e.g. 2, 4, 8) on the per-particle PointwiseConv1D
-   layers to cut DSP/LUT (LUT is 78% of one SLR); trade against latency and II.
-9. Check whether the 628 BRAM are mostly stream FIFOs; run hls4ml FIFO depth
-   optimization (`fifo_depth_optimization` flow) to shrink them.
-10. Try `io_parallel` for comparison (latency vs resources), and a different
-    clock target if the application needs it.
-11. Run Vivado logic synthesis (`hls_model.build(..., vsynth=True)`) for real
-    post-synthesis resource and timing numbers instead of HLS estimates.
-12. Revisit the fixed batch dim of 64 in the export if the target interface
-    wants per-jet streaming; the HLS model already processes one jet per call.
+7. Raise `ReuseFactor` (e.g. 2, 4, 8) on the per-particle PointwiseConv1D layers to cut DSP/LUT, traded
+   against latency and II.
+8. Check whether the BRAM usage is mostly stream FIFOs. If so, run hls4ml FIFO depth optimization (the
+   `fifo_depth_optimization` flow).
+9. Try a different clock target if the application needs it.
+10. Revisit the fixed batch dim of 64 in the export if the target interface wants per-jet streaming. The
+    HLS model already processes one jet per call.
 
 ### Housekeeping
 
-13. Report the six hls4ml bugs (and the ignored `Precision["table"]`) upstream
-    or to the qibin2020 fork, so `convert.py` can drop its monkeypatches.
-14. `hls_prj/` and `logs/` (`convert_log.txt`, `synth_log.txt`) are generated artifacts;
-    add them to `.gitignore` if not wanted in the repo.
+11. Report the six hls4ml bugs, the ignored `Precision["table"]` and the missing `GlobalPooling1D`/ReLU
+    type inference upstream (or to the qibin2020 fork), so `convert.py` can drop its monkeypatches.
