@@ -44,6 +44,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--onnx", default="onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant_clean.onnx")
 p.add_argument("--synth", action="store_true")
 p.add_argument("--clock", type=float, default=5.0, help="target clock period in ns")
+p.add_argument("--mult-limit-fix", action="store_true", help="io_parallel: conv multiplier limit covers all PF pixels")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
 p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
@@ -58,6 +59,8 @@ if args.io_type == "io_parallel":
     OUT_DIR += f"_pf{args.pf}"
 if args.clock != 5:
     OUT_DIR += f"_clk{args.clock:g}"
+if args.mult_limit_fix:
+    OUT_DIR += "_mlf"
 
 # hls4ml bug: Layer._validate_attributes wraps ApplyAlpha's scale/bias_precision in NamedType, and
 # ScaleDownAdd rebuilds ApplyAlpha from those attributes, which update_precision rejects. Unwrap it.
@@ -161,6 +164,7 @@ onnx_to_hls.parse_onnx_model = _parse_onnx_drop_pool_transpose
 model = ModelWrapper(args.onnx)
 model = cleanup_model(model).transform(GemmToMatMul())
 model = cleanup_model(model)
+N_PART = model.get_tensor_shape(model.graph.input[0].name)[1]  # particles per jet (64 for r7)
 
 cfg = hls4ml.utils.config_from_onnx_model(
     model, granularity="name", backend="Vitis", default_precision="fixed<16,6>", default_reuse_factor=args.reuse_factor
@@ -206,10 +210,11 @@ if is_quant(model.find_consumer(in_name)):
 # Sum over 64 particles overflows the default fixed<16,6> accumulator (wraps by 64 -> mean off by exactly 1.0)
 cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = "fixed<32,19>"
 if args.io_type == "io_parallel":
-    # Per-particle MatMul_0..3 become PointwiseConv1D "Dense_MatMul_<i>"; default PF=1 loops over the 64 particles.
-    # Set on MatMul_<i>: MatmulConstToDense copies that config over any "Dense_MatMul_<i>" entry.
-    for i in range(4):
-        cfg["LayerName"][f"MatMul_{i}"]["ParallelizationFactor"] = args.pf
+    # Per-particle MatMuls (rank-3 input) become PointwiseConv1D "Dense_MatMul_<i>"; default PF=1 loops over the
+    # particles. Set on MatMul_<i>: MatmulConstToDense copies that config over any "Dense_MatMul_<i>" entry.
+    for node in model.get_nodes_by_op_type("MatMul"):
+        if len(model.get_tensor_shape(node.input[0])) == 3:
+            cfg["LayerName"][node.name]["ParallelizationFactor"] = args.pf
 
 
 def convert(hls_cfg):
@@ -232,10 +237,19 @@ def convert(hls_cfg):
 #   fixed<16,6> and truncates. ReLU is exact in its input's type.
 first = convert(copy.deepcopy(cfg)).graph
 pool_in = first["GlobalAveragePool_0"].get_input_variable().type.precision
+# Other N: see mini_parallel.py (6 more fractional bits keep the truncated sum / N away from rounding ties).
+k = int(np.ceil(np.log2(N_PART)))
+extra = 0 if N_PART & (N_PART - 1) == 0 else 6
 if isinstance(pool_in, FixedPrecisionType):
     w, i = pool_in.width, pool_in.integer
-    cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = f"fixed<{w + 12},{i + 6}>"
-    cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = f"fixed<{w + 6},{i}>"
+    cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = f"fixed<{w + 2 * k + extra},{i + k}>"
+    cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = f"fixed<{w + k},{i}>"
+# io_parallel: a full-quant pool -> Flatten -> Quant rounds in the pool itself (exact for the types above). As a
+# separate zero-latency Quant it chains with the next alpha + Quant in one cycle and misses 5 ns.
+gap = model.get_nodes_by_op_type("GlobalAveragePool")[0]
+pool_q = model.find_consumer(model.find_consumer(gap.output[0]).output[0])
+if args.io_type == "io_parallel" and is_quant(pool_q):
+    cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = quant_type(pool_q)
 for relu in model.get_nodes_by_op_type("Relu"):
     layer = first.get(relu.name)
     if layer is not None and layer.get_output_variable().type.precision.rounding_mode.name == "TRN":
@@ -244,6 +258,13 @@ for relu in model.get_nodes_by_op_type("Relu"):
             cfg["LayerName"][relu.name]["Precision"]["result"] = f"fixed<{in_t.width},{in_t.integer}>"
 hls_model = convert(cfg)
 hls_model.compile()
+if args.mult_limit_fix:  # synthesis-only, see mini_parallel.py: II = n_partitions instead of growing with PF
+    f = f"{OUT_DIR}/firmware/nnet_utils/nnet_conv1d_latency.h"
+    old = "    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::mult_config::multiplier_limit"
+    src = open(f).read()
+    assert old in src
+    open(f, "w").write(src.replace(old, "    const unsigned mult_limit_all = CONFIG_T::mult_config::multiplier_limit * "
+                                   "CONFIG_T::n_pixels;\n    #pragma HLS ALLOCATION operation instances=mul limit=mult_limit_all"))
 
 
 def run_both(x):
@@ -253,14 +274,14 @@ def run_both(x):
 
 
 # Smoke test on random input
-x = np.random.default_rng(0).standard_normal((BATCH, 64, 4)).astype(np.float32)
+x = np.random.default_rng(0).standard_normal((BATCH, N_PART, 4)).astype(np.float32)
 ref, hls = run_both(x)
 print(f"[random] max|dlogit|={np.abs(ref - hls).max():.4g} argmax agree={np.mean(ref.argmax(1) == hls.argmax(1)):.4f}")
 
 # Real jets, full batches only (graph batch dim fixed at 64)
 data = np.load("top_test_10k_n64.npz")
 n = len(data["x"]) // BATCH * BATCH
-X, y = data["x"][:n].astype(np.float32), data["y"][:n]
+X, y = data["x"][:n, :N_PART].astype(np.float32), data["y"][:n]  # leading-pT slots, like --deepsets-fixed-n
 refs, hlss = zip(*(run_both(X[i : i + BATCH]) for i in range(0, n, BATCH)))
 ref, hls = np.concatenate(refs), np.concatenate(hlss)
 print(f"[jets n={n}] max|dlogit|={np.abs(ref - hls).max():.4g} argmax agree={np.mean(ref.argmax(1) == hls.argmax(1)):.4f}")

@@ -370,10 +370,19 @@ if fq:  # exact types, as convert.py sets them for the full-quant graph
     first = convert(copy.deepcopy(cfg)).graph
     pool_in = first["GlobalAveragePool_0"].get_input_variable().type.precision
     k = int(np.ceil(np.log2(args.n)))  # exact /n for power-of-2 n
+    # Other n: the pool truncates sum / n in accum_t, and the true mean is never closer than 1 / (n * 2^10) to a
+    # rounding tie of the 10-bit pool Quant, so >= log2(n) + 11 fractional bits keep it exact (6 more than 2k).
+    extra = 0 if args.n & (args.n - 1) == 0 else 6
     if isinstance(pool_in, FixedPrecisionType):
         w, i = pool_in.width, pool_in.integer
-        cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = f"fixed<{w + 2 * k},{i + k}>"
+        cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = f"fixed<{w + 2 * k + extra},{i + k}>"
         cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = f"fixed<{w + k},{i}>"
+    # r7 pool -> Flatten -> Quant: round in the pool itself (exact for power-of-2 n). As a separate zero-latency
+    # Quant it chains with the next alpha + Quant in one cycle (2.98 + 2.82 ns) and misses 5 ns in io_parallel.
+    gap = model.get_nodes_by_op_type("GlobalAveragePool")[0]
+    q = model.find_consumer(model.find_consumer(gap.output[0]).output[0])
+    if is_quant(q):
+        cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = quant_type(q)
     for r in model.get_nodes_by_op_type("Relu"):
         layer = first.get(r.name)
         if layer is not None and layer.get_output_variable().type.precision.rounding_mode.name == "TRN":
