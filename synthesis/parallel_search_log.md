@@ -66,3 +66,5 @@ Resources are % of one SLR (432k LUT, 864k FF, 3072 DSP, 1344 BRAM_18K) from csy
 | H2 | rdsrv | io_parallel | 2 | 2.78 ns | convert.py on F-k2 export (d12p1r1 n32): PF2 mlf clone-fanout | done | 16 / 44.5 | 74 / 26 / 0 | 2.03 | 0.9566 | bit-exact; acc 0.8933, 1/eB 43.1; float 0.9662. Fits k=2 but loses to d8p2r1 n16 (H1d, 0.9653). Project renamed hls_prj/deepsets_ps_d12p1r1_n32_io_parallel_pf2_clk2.78_mlf_clone |
 | F-eval | nersc 59159879/59160653 | float eval | - | - | finalist float KD checkpoints, full test set | done | | | | | d8p2r1 n16 0.9685; d32p2r1 n16 0.9755; d8p1r1 n32 0.9631; d12p1r1 n32 0.9662 |
 | H1r | rdsrv | io_parallel | 1 | 2.78 ns | rebuild of H1 (its project was overwritten by H2, same convert.py name) | done | 8 / 22.2 | 59 / 18 / 0 | 1.96 | 0.9653 | identical to H1 |
+| H1f | rdsrv | io_parallel | 1 | 2.78 ns | H1 + --dsp-mult (real weights) | done | 8 / 22.2 | 56 / 18 / 10 | 1.96 | 0.9653 | 245k LUT, 328 DSP (-5% LUT vs H1) |
+| F-k1d | nersc 59160947 | finalist | 1 | 2.78 ns | d12p2r1m1 n16 (mlp_ratio 1): same chain | running (started 07:48, ~3 h) | | | | | HLS not run tonight |

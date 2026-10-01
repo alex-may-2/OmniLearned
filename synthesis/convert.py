@@ -47,6 +47,7 @@ p.add_argument("--synth", action="store_true")
 p.add_argument("--clock", type=float, default=5.0, help="target clock period in ns")
 p.add_argument("--mult-limit-fix", action="store_true", help="io_parallel: conv multiplier limit covers all PF pixels")
 p.add_argument("--clone-fanout", action="store_true", help="io_parallel: one copy per reader of each residual skip array")
+p.add_argument("--dsp-mult", action="store_true", help="bind all multiplies to DSPs (config_op mul -impl dsp)")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
 p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
@@ -65,6 +66,8 @@ if args.mult_limit_fix:
     OUT_DIR += "_mlf"
 if args.clone_fanout:
     OUT_DIR += "_clone"
+if args.dsp_mult:
+    OUT_DIR += "_dsp"
 
 # hls4ml bug: Layer._validate_attributes wraps ApplyAlpha's scale/bias_precision in NamedType, and
 # ScaleDownAdd rebuilds ApplyAlpha from those attributes, which update_precision rejects. Unwrap it.
@@ -311,6 +314,11 @@ def clone_fanout(cpp, top):
 
 if args.clone_fanout:
     clone_fanout(f"{OUT_DIR}/firmware/deepsets.cpp", "deepsets")
+if args.dsp_mult:  # synthesis-only, as mini_parallel.py --dsp-mult
+    tcl, clk = f"{OUT_DIR}/build_prj.tcl", "create_clock -period $clock_period -name default"
+    src = open(tcl).read()
+    assert clk in src
+    open(tcl, "w").write(src.replace(clk, clk + "\nconfig_op mul -impl dsp"))
 
 
 def run_both(x):

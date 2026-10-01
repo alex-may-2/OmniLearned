@@ -169,8 +169,11 @@ keeps the phi block.
 1. **Vivado synthesis and place-and-route of the k=1 design** at 360 MHz (and the 200 MHz fallback), with a pblock
    on one SLR. csynth estimates 1.96 ns against 2.78 ns, but at 59% LUT the routed timing is the real question.
 2. **Full training of the mlp_ratio-1 shape d12p2r1m1 n16** (k=1, 63% LUT). It keeps the phi block, which p1
-   showed matters. Use `--size d12p2r1m1`; the suffix is already on the branch.
-3. **Real-weight `--dsp-mult`** on the k=1 build: −11% LUT at random weights.
+   showed matters. It was launched 07:48 on nersc (interactive job 59160947, `ps_final.sbatch`, about 3 h). Its export
+   will be `qonnx/fpga/qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx`; then run the k=1 `convert.py` line with
+   that graph.
+3. ~~Real-weight `--dsp-mult` on the k=1 build~~ done (H1f): 59 → 56% LUT with 328 DSPs (10%), same II, timing
+   and AUC. `convert.py --dsp-mult` now exists.
 4. **The round-robin distributor and merger** if k > 1 is ever used.
 
 ## 8. Reproduce
