@@ -344,6 +344,8 @@ for name, logits in (("qonnx", ref), ("hls", hls)):
     acc, auc, rej = metrics(logits)
     print(f"[{name}] acc={acc:.4f} AUC={auc:.4f} 1/eB@eS=0.5={rej:.1f}")
 
+if args.synth and np.abs(ref - hls).max() > 0:
+    raise SystemExit("C-sim is not bit-exact on the jets: no synthesis")
 if args.synth:
     hls_model.build(csim=False, synth=True, export=False)
     hls4ml.report.read_vivado_report(OUT_DIR)

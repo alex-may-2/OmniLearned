@@ -12,8 +12,8 @@ Resources are % of one SLR (432k LUT, 864k FF, 3072 DSP, 1344 BRAM_18K) from csy
 | T2 | rdsrv | io_stream | 2 | 2.78 ns | mini ds d32 n12 | refused | | | | | C-sim 0.006 off: mean over n=12 truncated; fixed with 6 more pool accum fraction bits (rerun T2b) |
 | T1 | rdsrv | io_stream | 4 | 2.78 ns | mini ds d32 n32 | done | 38 / 105.6 | 83 / 27 / 81 | 3.04 MISS | | II = n + 6 here; misses k=4 budget (100 ns) and clock; 360k LUT, 2516 DSP |
 | L3 | rdsrv | io_parallel | 1 | 5 ns | mini ds d8 n16 PF16 RF5 --mult-limit-fix | done | 5 / 25 | 102 / 5 / 0 | 3.53 | | RF not applied (all reuse_factor 1); PF=n made hls4ml pick pipeline style: FF 47k, LUT 439k, 50 GB, 18 min. Loses to L2 |
-| S-ctl | nersc 59152539 | float KD | - | - | d32p2r1 n64, 20 ep, 1 node | pending (interactive) | | | | | regular QOS had ~4800 GPU jobs pending: moved to salloc -q interactive (max 2 jobs/user) |
-| S-d8n16 | nersc 59152495 | float KD | - | - | d8p2r1 n16, 20 ep | running (interactive) | | | | | io_parallel k=1 |
+| S-ctl | nersc 59152539 | float KD | - | - | d32p2r1 n64, 20 ep, 1 node | done | | | | 0.9708 | acc 0.9151, 1/eB 89.8; vs 0.9770 fully trained: short-schedule correction ~ +0.006. Regular QOS had ~4800 GPU jobs pending, so screens/finalists use salloc -q interactive (2 jobs/user) |
+| S-d8n16 | nersc 59152495 | float KD | - | - | d8p2r1 n16, 20 ep | done | | | | 0.9672 | acc 0.9074, 1/eB 83.4, full test set (404k jets) |
 | S-d12n16 | nersc | float KD | - | - | d12p2r1 n16, 20 ep | not started | | | | | interactive QOS allows 2 jobs/user |
 | S-d32n32 | nersc | float KD | - | - | d32p2r1 n32, 20 ep | not started | | | | | interactive QOS allows 2 jobs/user |
 | L2b | rdsrv | io_parallel | 1 | 5 ns | L2 + pool-result Quant type | done | 4 / 20 | 68 / 15 / 0 | 5.84 MISS | | chain moved: pool (3.0) -> rho alpha+Quant (2.8). Next fix: register pool output (LATENCY min=1) |
@@ -21,12 +21,40 @@ Resources are % of one SLR (432k LUT, 864k FF, 3072 DSP, 1344 BRAM_18K) from csy
 | L6a | rdsrv | io_parallel | 1 | 3.125 ns | d8 n16 PF2 mlf (+pool LATENCY min=1) | done | 8 / 25.0 | 57 / 16 / 0 | 4.55 MISS | | II meets k=1; pool register did not help. Cause: pool output and residual skip arrays have 2 readers in DATAFLOW -> clone fix (L6c) |
 | T2b | rdsrv | io_stream | 2 | 2.78 ns | mini ds d32 n12 | done | 23 / 63.9 | 84 / 29 / 86 | 3.04 MISS | | II = n + 11: io_stream cannot meet k=2 (50 ns) |
 | L4 | rdsrv | io_parallel | 1 | 5 ns | L2b + --dsp-mult | done | 4 / 20 | 60 / 15 / 26 | 5.84 MISS | | 804 mults to DSP, LUT 263k (-11% vs L2b). Keep (free). Miss = fan-out chain (pre-clone) |
-| L5 | rdsrv | io_parallel | 1 | 5 ns | L2b + --pipeline-style pipeline | queued | | | | | |
+| L5 | rdsrv | io_parallel | 1 | 5 ns | L2b + --pipeline-style pipeline | done | 2 / 10 | 98 / 8 / 0 | 3.61 | | top PIPELINE unrolls all (PF ignored): meets clock, no FIFOs (FF 69k), LUT 424k. Next: top II = C (L7a/L7b) |
 | L6b | rdsrv | io_parallel | 1 | 2.78 ns | d8 n16 PF2 mlf + fan-out clones | done | 8 / 22.2 | 60 / 18 / 0 | 2.01 | | FIRST k=1 PASS (csynth only): 263k LUT, latency 98 cyc = 272 ns. Clone fix removes the chain |
-| L2c | rdsrv | io_parallel | 1 | 5 ns | L2b + pool output register | queued | | | | | |
-| M1-M4 | rdsrv | io_parallel | 1 | 2.78 ns | L6b + p1 / r0 / ratio 1 / no embed DyT | queued | | | | | model knobs (re-planned on L6b) |
+| L2c | rdsrv | io_parallel | 1 | 5 ns | d8 n16 PF4 mlf + fan-out clones | done | 4 / 20 | 69 / 16 / 0 | 3.65 | | k=1 PASS at 200 MHz (302k LUT); 360 MHz PF2 (L6b) is leaner |
 | B1-B5 | rdsrv | io_parallel | 1-2 | 2.78 ns | d12n16 PF2, d8n32 PF4 (k=1); d16n8 PF1 (k=1); d16n16 PF1, d12n16 PF1 (k=2) | queued | | | | | Phase 1b at 360 MHz |
 | T4 | rdsrv | io_stream | 4 | 3.125 ns | mini ds d32 n24 --strategy Latency | done | 32 / 99.8 | 115 / 20 / 5 | 2.28 | | meets II and clock but mults went to LUT (500k). T6 adds --dsp-mult |
 | T5 | rdsrv | io_stream | 4 | 4.17 ns | mini ds d32 n16 | done | 20 / 83.4 | 82 / 21 / 81 | 3.04 | | k=4 PASS (csynth only); LUT 82% > 80% target; n 20 would give II 24 = 100 ns |
 | L6c | rdsrv | io_parallel | 1 | 3.125 ns | L6a with fan-out clones | done | 8 / 25.0 | 58 / 17 / 0 | 2.28 | | k=1 PASS at 320 MHz too (254k LUT). ~25 min of rdsrv idle after it (stuck queue waiter, fixed) |
-| T6 | rdsrv | io_stream | 4 | 3.125 ns | T4 + --dsp-mult | queued | | | | | |
+| T7 | rdsrv | io_stream | 4 | 4.17 ns | mini ds d32 n20 | done | 26 / 108.4 | 82 / 21 / 86 | 3.04 | | over budget (II = n + 6): k=4 at 240 MHz stays n16 |
+| B1 | rdsrv | io_parallel | 1 | 2.78 ns | d12 n16 PF2 mlf clones | done | 8 / 22.2 | 97 / 29 / 0 | 2.01 | | fits hard limit only (422k LUT); over 80% target |
+| T6 | rdsrv | io_stream | 4 | 3.125 ns | d32 n24 Latency + dsp-mult | done | 35 / 109.2 | 83 / 21 / 116 | 2.28 | | fails (DSP 3564, II 35). k=4 finalist: io_stream d32 n16 at 240 MHz (T5) |
+| F-k1 | nersc 59153355 | finalist | 1 | 2.78 ns | d8p2r1 n16: float KD 50 ep, QAT r7 flags, export (ps_final.sbatch, interactive) | running | | | | | io_parallel PF2 mlf clones |
+| F-k4 | nersc 59153433 | finalist | 4 | 4.17 ns | d32p2r1 n16: same chain | running | | | | | io_stream Resource |
+| B2 | rdsrv | io_parallel | 1 | 2.78 ns | d8 n32 PF4 mlf clones | done | 8 / 22.2 | 116 / 36 / 0 | 2.01 | | does not fit (505k LUT) |
+| B3 | rdsrv | io_parallel | 1 | 2.78 ns | d16 n8 PF1 mlf clones | done | 8 / 22.2 | 79 / 23 / 0 | 2.01 | | alt k=1 shape (342k LUT); AUC unscreened |
+| B4 | rdsrv | io_parallel | 2 | 2.78 ns | d16 n16 PF1 mlf clones | done | 16 / 44.5 | 127 / 40 / 0 | 2.01 | | does not fit (549k LUT): slower II does not shrink elementwise cost; k=2 needs operator sharing (L7) |
+| B5 | rdsrv | io_parallel | 2 | 2.78 ns | d12 n16 PF1 mlf clones | done | | | | | II 16 cyc = 44.48 ns, latency 136 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 88 FF 27 DSP 0 BRAM 0 (LUT 381125, FF 239232, DSP 0) |
+| F-k2 | nersc (regular) | finalist | 2 | 2.78 ns | d12p2r1 n16: same chain, sbatch --time 3:30 | cancelled (never started) | | | | | io_parallel PF1 mlf clones (B5 88% LUT; B6 adds dsp-mult) |
+| M1 | rdsrv | io_parallel | 1 | 2.78 ns | L6b with p1 (no residual phi block) | done | 8 / 22.2 | 26 / 7 / 0 | 1.84 | | -56% LUT vs L6b (115k vs 263k): KEEP. Lets d16 n16 / d8 n32 fit k=1 if AUC holds |
+| M2 | rdsrv | io_parallel | 1 | 2.78 ns | L6b with r0 (no rho block) | done | | | | | II 8 cyc = 22.24 ns, latency 80 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 56 FF 17 DSP 0 BRAM 0 (LUT 244033, FF 152535, DSP 0), peak RAM 3.9 GB, wall 2:18.39 (-7%: drop knob) |
+| M3 | rdsrv | io_parallel | 1 | 2.78 ns | L6b with mlp_ratio 1 | done | | | | | II 8 cyc = 22.24 ns, latency 96 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 39 FF 12 DSP 0 BRAM 0 (LUT 172750, FF 111837, DSP 0), peak RAM 2.7 GB, wall 1:32.61 (-34%: KEEP; size suffix d<dim>p<p>r<r>m1 added on nersc) |
+| M4 | rdsrv | io_parallel | 1 | 2.78 ns | L6b without embed DyT | done | | | | | II 8 cyc = 22.24 ns, latency 97 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 57 FF 17 DSP 0 BRAM 0 (LUT 250533, FF 153583, DSP 0), peak RAM 3.7 GB, wall 2:10.54 (-5%: drop knob, no training code needed) |
+| S4 | nersc 59154321 (debug) | float KD x4 | - | - | 1 GPU each, 9 ep | partial | | | | | d12p2r1m1 n16: AUC 0.9511 (acc 0.8956, 1/eB 34.5); other 3 died on a shared rendezvous port |
+| S4b | nersc 59154553 (debug) | float KD x4 | - | - | 1 GPU each, 9 ep: d8p2r1 n16 (ref), d16p1r1 n16, d8p1r1 n32, d16p2r1m1 n16 | done | | | | | ref d8p2r1 n16 0.9456; d16p1r1 n16 0.9459; d16p2r1m1 n16 0.9455; d8p1r1 n32 0.9474; (S4: d12p2r1m1 n16 0.9511). Spread ~ noise at 9 ep: p1/m1 cost no measurable AUC |
+| L7a | rdsrv | io_parallel | 1 | 5 ns | d8 n16 pipeline style, top II 5, mlf | killed | | | | | 34 min in scheduling with II violations (no result); pipeline-II sharing not pursued tonight |
+| B6 | rdsrv | io_parallel | 2 | 2.78 ns | d12 n16 PF1 mlf clones dsp-mult | done | | | | | II 16 cyc = 44.48 ns, latency 136 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 83 FF 27 DSP 16 BRAM 0 (LUT 360916, FF 239232, DSP 505), peak RAM 6.7 GB, wall 4:20.70 |
+| P1 | rdsrv | io_parallel | 1 | 2.78 ns | d16 n16 p1 PF2 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 63 cyc, clock 2.78 -> est 1.856 ns, %SLR LUT 62 FF 17 DSP 0 BRAM 0 (LUT 269212, FF 150652, DSP 0), peak RAM 4.8 GB, wall 3:02.63 |
+| P2 | rdsrv | io_parallel | 1 | 2.78 ns | d8 n32 p1 PF4 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 62 cyc, clock 2.78 -> est 1.842 ns, %SLR LUT 48 FF 14 DSP 0 BRAM 0 (LUT 209124, FF 126339, DSP 0), peak RAM 4.5 GB, wall 2:46.37 |
+| F-k1b | nersc | finalist | 1 | 2.78 ns | d8p1r1 n32: same chain, next interactive slot | waiting for slot | | | | | io_parallel PF4 mlf clones (P2: 48% LUT) |
+| L7b | rdsrv | io_parallel | 1 | 3.125 ns | d8 n16 pipeline style, top II 8, mlf | killed | | | | | skipped after L7a stalled in scheduling |
+| P3 | rdsrv | io_parallel | 2 | 2.78 ns | d16 n32 p1 PF2 mlf clones | done | | | | | II 16 cyc = 44.48 ns, latency 80 cyc, clock 2.78 -> est 1.856 ns, %SLR LUT 97 FF 29 DSP 0 BRAM 0 (LUT 420228, FF 253773, DSP 0), peak RAM 13.0 GB, wall 9:09.12 |
+| P4 | rdsrv | io_parallel | 2 | 2.78 ns | d24 n16 p1 PF1 mlf clones | done | | | | | II 16 cyc = 44.48 ns, latency 84 cyc, clock 2.78 -> est 1.856 ns, %SLR LUT 94 FF 26 DSP 0 BRAM 0 (LUT 408639, FF 228688, DSP 0), peak RAM 8.6 GB, wall 6:02.07 |
+| Q1 | rdsrv | io_parallel | 1 | 2.78 ns | d12 n16 m1 PF2 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 100 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 63 FF 19 DSP 0 BRAM 0 (LUT 273945, FF 169980, DSP 0), peak RAM 4.3 GB, wall 2:31.69 |
+| F-k1c | nersc | finalist | 1 | 2.78 ns | d12p2r1m1 n16 | dropped | | | | | replaced by the k=2 design below |
+| Q2 | rdsrv | io_parallel | 1 | 2.78 ns | d16 n16 m1 PF2 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 103 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 92 FF 29 DSP 0 BRAM 0 (LUT 399003, FF 252544, DSP 0), peak RAM 6.4 GB, wall 3:55.34 |
+| R1 | rdsrv | io_parallel | 2 | 2.78 ns | d12 n32 p1 PF2 mlf clones | done | | | | | II 16 cyc = 44.48 ns, latency 79 cyc, clock 2.78 -> est 2.029 ns, %SLR LUT 68 FF 21 DSP 0 BRAM 0 (LUT 297869, FF 182983, DSP 0), peak RAM 8.0 GB, wall 5:15.61 |
+| F-k2 | nersc | finalist | 2 | 2.78 ns | d12p1r1 n32: same chain, slot after F-k1b | waiting for slot | | | | | io_parallel PF2 mlf clones (R1: II 16 = 44.5 ns, 68% LUT) |
+| R2 | rdsrv | io_parallel | 1 | 2.78 ns | d12 n32 p1 PF4 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 63 cyc, clock 2.78 -> est 2.029 ns, %SLR LUT 77 FF 22 DSP 0 BRAM 0 (LUT 332925, FF 195684, DSP 0), peak RAM 8.2 GB, wall 5:33.54 |
