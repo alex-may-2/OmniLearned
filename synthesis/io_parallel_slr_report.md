@@ -20,19 +20,22 @@ used by `convert.py`. On that subset r7 scores AUC 0.9744.
 
 | k | per-copy budget | design (trained) | family, clock | II cycles / ns | LUT / FF / DSP % SLR | clock est. | HLS AUC | status |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 25 ns | d8p2r1, n 16 | io_parallel PF 2, 360 MHz | 8 / 22.2 | 59 / 18 / 0 | 1.96 ns | **0.9653** | pass |
-| 1 | 25 ns | same graph | io_parallel PF 4, 200 MHz | 4 / 20.0 | 67 / 15 / 0 | 3.65 ns | **0.9653** | pass, more timing margin |
-| 1 | 25 ns | same graph | io_parallel PF 2, 320 MHz | 8 / 25.0 | 57 / 17 / 0 | 2.28 ns | **0.9653** | pass |
-| 2 | 50 ns | d8p2r1, n 16 (same graph) | io_parallel PF 1, 360 MHz | 16 / 44.5 | 55 / 17 / 0 | 1.96 ns | **0.9653** | pass |
-| 2 | 50 ns | d12p1r1, n 32 | io_parallel PF 2, 360 MHz | 16 / 44.5 | 74 / 26 / 0 | 2.03 ns | 0.9566 | fits, but loses to the d8p2r1 n16 build above |
+| 1 | 25 ns | **d12p2r1m1, n 16** (mlp_ratio 1) | io_parallel PF 2, 360 MHz | 8 / 22.2 | 66 / 21 / 0 | 2.03 ns | **0.9685** | **pass, best k=1** |
+| 1 | 25 ns | d8p2r1, n 16 | io_parallel PF 2, 360 MHz | 8 / 22.2 | 59 / 18 / 0 | 1.96 ns | 0.9653 | pass, smaller |
+| 1 | 25 ns | d8p2r1, n 16 | io_parallel PF 4, 200 MHz | 4 / 20.0 | 67 / 15 / 0 | 3.65 ns | 0.9653 | pass, more timing margin |
+| 1 | 25 ns | d8p2r1, n 16 | io_parallel PF 2, 320 MHz | 8 / 25.0 | 57 / 17 / 0 | 2.28 ns | 0.9653 | pass |
+| 2 | 50 ns | **d12p2r1m1, n 16** | io_parallel PF 1, 360 MHz | 16 / 44.5 | 61 / 20 / 0 | 2.03 ns | **0.9685** | **pass, best k=2** |
+| 2 | 50 ns | d8p2r1, n 16 | io_parallel PF 1, 360 MHz | 16 / 44.5 | 55 / 17 / 0 | 1.96 ns | 0.9653 | pass |
+| 2 | 50 ns | d12p1r1, n 32 | io_parallel PF 2, 360 MHz | 16 / 44.5 | 74 / 26 / 0 | 2.03 ns | 0.9566 | fits, but loses to both builds above |
 | 4 | 100 ns | d32p2r1, n 16 (r7 width) | io_stream, 240 MHz | 20 / 83.4 | 71 / 16 / 37 | 3.04 ns | **0.9712** | pass |
 
-- **k=1 meets all three axes:**
-  - II ≤ 25 ns with one copy in one SLR;
-  - AUC 0.9653 ≥ 0.9644;
-  - latency 99 cycles = 275 ns at 360 MHz (60 cycles = 300 ns at 200 MHz).
+- **k=1 meets all three axes with d12p2r1m1 n16** (finished 10:42 on 2026-10-01):
+  - II 22.2 ns with one copy at 66% of one SLR;
+  - AUC 0.9685, only 0.006 below r7's 0.9744 on the same jets, with float 0.9731;
+  - latency 100 cycles = 278 ns.
+- **d8p2r1 n16** also passes: 0.9653 at 59% LUT, latency 275 ns at 360 MHz or 300 ns at 200 MHz.
 - **k=2 gains nothing over k=1.** A slower II does not shrink the elementwise cost, and the larger k=2-only shape
-  (d12p1r1 n32, no phi block) trains worse. The best k=2 design is the k=1 graph at PF 1 (55% LUT, AUC 0.9653).
+  (d12p1r1 n32, no phi block) trains worse. The best k=2 design is the k=1 winner at PF 1 (61% LUT, AUC 0.9685).
 - **k=4 gives up 3 SLRs for +0.006 AUC:** io_stream keeps the r7 width; latency 384 ns.
 - **Extra finalist d8p1r1 n32 (no residual phi block, 32 particles)** fits k=1 (II 22.2 ns, 51% LUT) but reaches only AUC 0.9532. Dropping the phi block costs about 0.005 AUC in float (0.9631 vs 0.9685) and loses more in QAT (about 0.01). The 9-epoch screens did not show this.
 - **What made io_parallel work:**
@@ -94,7 +97,7 @@ Two conversion details had to change:
 | run | knob | LUT | vs L6b (263k) | keep? |
 |---|---|---|---|---|
 | M1 | p1: no residual phi block | 115k | −56% | hardware yes (`--size d<dim>p1r1`, no code), but costs ~0.012 AUC after full training (§5) |
-| M3 | mlp_ratio 1 | 173k | −34% | yes, new size suffix `d<dim>p<p>r<r>m1` (nersc `utils.py`, +2 lines) |
+| M3 | mlp_ratio 1 | 173k | −34% | **yes**: new size suffix `d<dim>p<p>r<r>m1` (nersc `utils.py`, +2 lines); d12p2r1m1 n16 is the best k=1 model |
 | M2 | r0: no rho block | 244k | −7% | no |
 | M4 | no embed DyT | 251k | −5% | no |
 
@@ -122,8 +125,8 @@ Short screens trained 9 epochs on 1 GPU each (compare within this table only):
 
 At 9 epochs the knobs showed no AUC cost, **but full training disagrees for p1**: d8p1r1 n32 reaches QAT AUC 0.9532
 vs 0.9653 for d8p2r1 n16. Short single-GPU screens are too noisy and too undertrained to rank architectures; use
-them only as a smoke test. mlp_ratio 1 (m1) has not been fully trained yet. It is the knob to try next, because it
-keeps the phi block.
+them only as a smoke test. mlp_ratio 1 (m1) does hold up under full training. It keeps the phi block, and the LUT it
+saves buys width: d12p2r1m1 n16 reaches QAT AUC 0.9685 (float 0.9731) at 66% LUT.
 
 ## 4. io_stream (k=4)
 
@@ -149,6 +152,7 @@ keeps the phi block.
 | d8p2r1 n16, 20 ep (screen) | 0.9672 | — | 0.9074 | 83.4 |
 | **d8p2r1 n16, 50 ep + QAT (k=1)** | 0.9685 | **0.9653** | 0.9038 | 79.4 |
 | **d32p2r1 n16, 50 ep + QAT (k=4)** | 0.9755 | **0.9712** | 0.9111 | 158.8 |
+| **d12p2r1m1 n16, 50 ep + QAT (k=1, k=2)** | 0.9731 | **0.9685** | 0.9081 | 94.1 |
 | d8p1r1 n32, 50 ep + QAT (k=1 extra) | 0.9631 | 0.9532 | 0.8930 | 37.4 |
 | d12p1r1 n32, 50 ep + QAT (k=2 extra) | 0.9662 | 0.9566 | 0.8933 | 43.1 |
 
@@ -168,10 +172,10 @@ keeps the phi block.
 
 1. **Vivado synthesis and place-and-route of the k=1 design** at 360 MHz (and the 200 MHz fallback), with a pblock
    on one SLR. csynth estimates 1.96 ns against 2.78 ns, but at 59% LUT the routed timing is the real question.
-2. **Full training of the mlp_ratio-1 shape d12p2r1m1 n16** (k=1, 63% LUT). It keeps the phi block, which p1
-   showed matters. It was launched 07:48 on nersc (interactive job 59160947, `ps_final.sbatch`, about 3 h). Its export
-   will be `qonnx/fpga/qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx`; then run the k=1 `convert.py` line with
-   that graph.
+2. ~~Full training of d12p2r1m1 n16~~ done: it is the new k=1/k=2 winner (AUC 0.9685).
+   - Its LUT headroom (66%) leaves room for d12–d14 m1 at n 16–24.
+   - Next model try: d16p2r1m1 n16 was 92% at random weights. d14p2r1m1, or d12p2r1m1 at n 24 (PF 3), is the
+     likely next step.
 3. ~~Real-weight `--dsp-mult` on the k=1 build~~ done (H1f): 59 → 56% LUT with 328 DSPs (10%), same II, timing
    and AUC. `convert.py --dsp-mult` now exists.
 4. **The round-robin distributor and merger** if k > 1 is ever used.
@@ -182,7 +186,8 @@ Training (nersc, branch `parallel-search`; on gpu_interactive, wrap the line in
 `salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 --gpus-per-node 4 -A m3246 bash scripts/ps_final.sbatch`):
 
 ```
-SIZE=d8p2r1  N=16 sbatch scripts/ps_final.sbatch   # k=1   -> qat_ps_d8p2r1_n16_e50_8bit_fullQuant_clean.onnx
+SIZE=d12p2r1m1 N=16 sbatch scripts/ps_final.sbatch   # k=1/2 -> qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx
+SIZE=d8p2r1  N=16 sbatch scripts/ps_final.sbatch   # k=1 (smaller) -> qat_ps_d8p2r1_n16_e50_8bit_fullQuant_clean.onnx
 SIZE=d32p2r1 N=16 sbatch scripts/ps_final.sbatch   # k=4   -> qat_ps_d32p2r1_n16_e50_8bit_fullQuant_clean.onnx
 SIZE=d12p1r1 N=32 sbatch scripts/ps_final.sbatch   # k=2
 ```
@@ -195,8 +200,8 @@ SIZE=d12p1r1 N=32 sbatch scripts/ps_final.sbatch   # k=2
 HLS (rdsrv, `synthesis/`):
 
 ```
-python convert.py --onnx onnx_graphs/qat_ps_d8p2r1_n16_e50_8bit_fullQuant_clean.onnx --io-type io_parallel \
-    --strategy Latency --pf 2 --mult-limit-fix --clone-fanout --clock 2.78 --synth          # k=1, 360 MHz
+python convert.py --onnx onnx_graphs/qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx --io-type io_parallel \
+    --strategy Latency --pf 2 --mult-limit-fix --clone-fanout --clock 2.78 --synth          # k=1, 360 MHz (--pf 1: k=2)
 python convert.py --onnx onnx_graphs/qat_ps_d32p2r1_n16_e50_8bit_fullQuant_clean.onnx --io-type io_stream \
     --clock 4.17 --synth                                                                     # k=4, 240 MHz
 ```
@@ -207,3 +212,9 @@ The random-weight probes are `mini_parallel.py --distillnet ...` with the flags 
 **Note:** `convert.py` names projects from the graph suffix after `_8bit`, so every full-quant graph lands in
 `hls_prj/deepsets_distillnet_8bit_fullQuant_<io>_...`. Synthesize one graph per option set at a time, or move the
 project away first.
+
+Synthesized projects for the winners are on rdsrv under `synthesis/hls_prj/`:
+- `deepsets_ps_d12p2r1m1_n16_io_parallel_pf2_clk2.78_mlf_clone` (k=1);
+- `deepsets_ps_d12p2r1m1_n16_io_parallel_pf1_clk2.78_mlf_clone` (k=2);
+- `deepsets_ps_d8p2r1_n16_io_parallel_pf2_clk2.78_mlf_clone`;
+- `deepsets_distillnet_8bit_fullQuant_io_stream_resource_rf1_clk4.17` (k=4).
