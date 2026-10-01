@@ -15,13 +15,15 @@ def row(text, name):
 
 
 def summary(prj, log=None):
-    rpts = [r for r in glob.glob(f"{prj}/*_prj/solution1/syn/report/*_csynth.rpt") if "_s_csynth" not in r]
-    top = min(rpts, key=len)  # the top function's report has the shortest name
-    text = open(top).read()
+    sol = glob.glob(f"{prj}/*_prj")[0]  # <project>_prj; the top function is named <project>
+    text = open(f"{sol}/solution1/syn/report/{sol.split('/')[-1].removesuffix('_prj')}_csynth.rpt").read()
     clk = re.search(r"\|ap_clk\s*\|\s*([\d.]+) ns\|\s*([\d.]+) ns\|", text)
-    lat = re.search(r"Latency \(cycles\).*?\n.*?\n.*?\n\s*\|\s*(\d+)\|\s*(\d+)\|[^|]*\|[^|]*\|\s*(\d+)\|\s*(\d+)\|\s*(\S+)\|", text, re.S)
-    slr = row(text, "Utilization SLR (%)")  # BRAM_18K, DSP, FF, LUT, URAM
-    tot = row(text, "Total")
+    # first data row of "+ Latency: * Summary:" (the instance tables below it have the same header)
+    lat = re.search(r"\+ Latency:\s*\n\s*\* Summary:.*?\n\s*\|\s*(\d+)\|\s*(\d+)\|[^|]*\|[^|]*\|\s*(\d+)\|\s*(\d+)\|", text, re.S)
+    util = text[text.index("== Utilization Estimates"):]
+    util = util[: util.index("+ Detail")]  # Summary table only; the per-instance tables also have a Total row
+    slr = row(util, "Utilization SLR (%)")  # BRAM_18K, DSP, FF, LUT, URAM
+    tot = row(util, "Total")
     target, est = float(clk.group(1)), float(clk.group(2))
     ii = int(lat.group(4))
     out = (

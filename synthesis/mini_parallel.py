@@ -33,6 +33,7 @@ import argparse
 import copy
 import importlib
 import os
+import re
 
 import hls4ml
 import numpy as np
@@ -75,6 +76,8 @@ p.add_argument("--rf", type=int, default=1, help="ReuseFactor of the per-particl
 p.add_argument("--mult-limit-fix", action="store_true", help="conv multiplier limit covers all n_pixels of a partition")
 p.add_argument("--dsp-mult", action="store_true", help="bind all multiplies to DSPs (config_op mul -impl dsp)")
 p.add_argument("--pipeline-style", choices=["pipeline", "dataflow"], default=None, help="hls4ml Model PipelineStyle")
+p.add_argument("--pipeline-ii", type=int, default=None, help="with --pipeline-style pipeline: top-level II (hls4ml PipelineInterval)")
+p.add_argument("--strategy", choices=["Latency", "Resource"], default=None, help="default: Resource for io_stream, else Latency")
 p.add_argument("--synth", action="store_true")
 args = p.parse_args()
 fq = args.full_quant or args.distillnet
@@ -89,6 +92,8 @@ else:
     OUT_DIR = f"hls_prj/mini{'_fq' if fq else ''}_n{args.n}_phi{'-'.join(map(str, phi))}_rho{'-'.join(map(str, rho))}_pf{pf}"
 levers = [(f"rf{args.rf}", args.rf > 1), ("mlf", args.mult_limit_fix), ("dsp", args.dsp_mult)]
 levers += [(str(args.pipeline_style), args.pipeline_style), ("stream", stream), (f"clk{args.clock:g}", args.clock != 5)]
+levers += [(f"ii{args.pipeline_ii}", args.pipeline_ii)]
+levers += [(str(args.strategy).lower(), args.strategy and args.strategy != ("Resource" if stream else "Latency"))]
 OUT_DIR += "".join(f"_{tag}" for tag, on in levers if on)
 
 # --- hls4ml patches copied from convert.py (see the comments there) ---
@@ -322,10 +327,12 @@ model = cleanup_model(ModelWrapper(onnx_path))
 
 # --- convert ---
 cfg = hls4ml.utils.config_from_onnx_model(model, granularity="name", backend="Vitis", default_precision="fixed<16,6>")
-strategy = "Resource" if stream else "Latency"  # io_stream: as the r7 io_stream build (convert.py defaults)
+strategy = args.strategy or ("Resource" if stream else "Latency")  # io_stream default: as the r7 io_stream build
 cfg["Model"]["Strategy"] = strategy
 if args.pipeline_style:
     cfg["Model"]["PipelineStyle"] = args.pipeline_style
+if args.pipeline_ii:
+    cfg["Model"]["PipelineInterval"] = args.pipeline_ii
 for layer_cfg in cfg["LayerName"].values():
     layer_cfg["Strategy"] = strategy
 for i in range(n_pp):  # set on MatMul_<i>: MatmulConstToDense copies it onto the Dense_MatMul_<i> PointwiseConv1D
@@ -413,6 +420,47 @@ if args.mult_limit_fix:
         "    const unsigned mult_limit_all = CONFIG_T::mult_config::multiplier_limit * CONFIG_T::n_pixels;\n"
         "    #pragma HLS ALLOCATION operation instances=mul limit=mult_limit_all",
     )
+
+
+def clone_fanout(cpp):
+    """io_parallel residuals: the skip array of each Add is also read by the DyT branch. A DATAFLOW array with two
+    readers is not a channel, so Vitis chains the producer into both consumers (pool 3.0 ns + alpha/Quant 2.8 ns in
+    one cycle, misses 5 ns). Give each reader its own copy through a clone process, as hls4ml does for io_stream."""
+    src = open(cpp).read()
+    lines = src.split("\n")
+    decl = {m[1]: (m[0], m[2]) for m in re.findall(r"^\s*(\w+) (layer\w+)\[([^\]]+)\];", src, re.M)}
+    alias = dict(re.findall(r"auto& (layer\w+) = (layer\w+);", src))
+    calls = [i for i, l in enumerate(lines) if l.strip().startswith("nnet::")]
+    args = lambda l: [a.strip() for a in l[l.index(">(") + 2 : l.rindex(");")].split(",")]
+    n = 0
+    for i in [i for i in calls if lines[i].strip().startswith("nnet::add<")]:
+        skip = args(lines[i])[0]
+        readers = [j for j in calls if j != i and skip in args(lines[j])[: 1]]
+        if not readers:
+            continue
+        t, size = decl[alias.get(skip, skip)]
+        a, b = f"{skip}_cpa", f"{skip}_cpb"
+        j = readers[0]
+        lines[j] = lines[j].replace(f"({skip},", f"({a},", 1)
+        lines[i] = lines[i].replace(f"({skip},", f"({b},", 1)
+        lines[j] = (
+            f"    {t} {a}[{size}];\n    #pragma HLS ARRAY_PARTITION variable={a} complete dim=0\n"
+            f"    {t} {b}[{size}];\n    #pragma HLS ARRAY_PARTITION variable={b} complete dim=0\n"
+            f"    ps_clone<{t}, {size}>({skip}, {a}, {b});\n" + lines[j]
+        )
+        n += 1
+    clone = (
+        "template <class T, int N> void ps_clone(T src[N], T a[N], T b[N]) {\n    #pragma HLS PIPELINE\n"
+        "    for (int i = 0; i < N; i++) {\n        #pragma HLS UNROLL\n        a[i] = src[i];\n        b[i] = src[i];\n    }\n}\n\n"
+    )
+    out = "\n".join(lines)
+    k = out.index("void mini(")
+    open(cpp, "w").write(out[:k] + clone + out[k:])
+    print(f"[clone] {n} fan-out arrays split in {cpp}")
+
+
+if not stream:
+    clone_fanout(f"{OUT_DIR}/firmware/mini.cpp")
 if args.dsp_mult:
     clk = "create_clock -period $clock_period -name default"
     patch(f"{OUT_DIR}/build_prj.tcl", clk, clk + "\nconfig_op mul -impl dsp")
