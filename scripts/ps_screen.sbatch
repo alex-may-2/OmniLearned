@@ -14,7 +14,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH -J ps_screen
 #SBATCH -o /pscratch/sd/a/alexmay/omnilearned/logs/ps/slurm_%j_%x.out
 
