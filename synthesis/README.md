@@ -6,6 +6,8 @@ Notes for the agent or person running the FPGA step.
 - `convert.py` C-sim runs on Perlmutter or on SLAC rdsrv409.
 - Vitis HLS synthesis runs only on rdsrv409.
 
+**II ~ 25 ns search (2026-10-01):** `io_parallel_slr_report.md` has the per-copy-count winners. k=1 is d8p2r1 n16 io_parallel at 360 MHz (II 22 ns, 59% SLR, AUC 0.9653); k=4 is d32p2r1 n16 io_stream at 240 MHz. Run log: `parallel_search_log.md`. New flags: `convert.py --clock --mult-limit-fix --clone-fanout`.
+
 Graph changes are made on the PyTorch side in `tools/quantize/qat_deepsets.py`, which does the Brevitas
 wrapping (`network.py` stays Brevitas-free). Re-export with `tools/quantize/qat_deepsets_export_qonnx.py`.
 

@@ -31,8 +31,8 @@ Resources are % of one SLR (432k LUT, 864k FF, 3072 DSP, 1344 BRAM_18K) from csy
 | T7 | rdsrv | io_stream | 4 | 4.17 ns | mini ds d32 n20 | done | 26 / 108.4 | 82 / 21 / 86 | 3.04 | | over budget (II = n + 6): k=4 at 240 MHz stays n16 |
 | B1 | rdsrv | io_parallel | 1 | 2.78 ns | d12 n16 PF2 mlf clones | done | 8 / 22.2 | 97 / 29 / 0 | 2.01 | | fits hard limit only (422k LUT); over 80% target |
 | T6 | rdsrv | io_stream | 4 | 3.125 ns | d32 n24 Latency + dsp-mult | done | 35 / 109.2 | 83 / 21 / 116 | 2.28 | | fails (DSP 3564, II 35). k=4 finalist: io_stream d32 n16 at 240 MHz (T5) |
-| F-k1 | nersc 59153355 | finalist | 1 | 2.78 ns | d8p2r1 n16: float KD 50 ep, QAT r7 flags, export (ps_final.sbatch, interactive) | running | | | | | io_parallel PF2 mlf clones |
-| F-k4 | nersc 59153433 | finalist | 4 | 4.17 ns | d32p2r1 n16: same chain | running | | | | | io_stream Resource |
+| F-k1 | nersc 59153355 | finalist | 1 | 2.78 ns | d8p2r1 n16: float KD 50 ep, QAT r7 flags, export (ps_final.sbatch, interactive) | exported 04:30 (HLS run H1) | | | | | io_parallel PF2 mlf clones |
+| F-k4 | nersc 59153433 | finalist | 4 | 4.17 ns | d32p2r1 n16: same chain | exported 04:48 (HLS run H4) | | | | | io_stream Resource |
 | B2 | rdsrv | io_parallel | 1 | 2.78 ns | d8 n32 PF4 mlf clones | done | 8 / 22.2 | 116 / 36 / 0 | 2.01 | | does not fit (505k LUT) |
 | B3 | rdsrv | io_parallel | 1 | 2.78 ns | d16 n8 PF1 mlf clones | done | 8 / 22.2 | 79 / 23 / 0 | 2.01 | | alt k=1 shape (342k LUT); AUC unscreened |
 | B4 | rdsrv | io_parallel | 2 | 2.78 ns | d16 n16 PF1 mlf clones | done | 16 / 44.5 | 127 / 40 / 0 | 2.01 | | does not fit (549k LUT): slower II does not shrink elementwise cost; k=2 needs operator sharing (L7) |
@@ -48,7 +48,7 @@ Resources are % of one SLR (432k LUT, 864k FF, 3072 DSP, 1344 BRAM_18K) from csy
 | B6 | rdsrv | io_parallel | 2 | 2.78 ns | d12 n16 PF1 mlf clones dsp-mult | done | | | | | II 16 cyc = 44.48 ns, latency 136 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 83 FF 27 DSP 16 BRAM 0 (LUT 360916, FF 239232, DSP 505), peak RAM 6.7 GB, wall 4:20.70 |
 | P1 | rdsrv | io_parallel | 1 | 2.78 ns | d16 n16 p1 PF2 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 63 cyc, clock 2.78 -> est 1.856 ns, %SLR LUT 62 FF 17 DSP 0 BRAM 0 (LUT 269212, FF 150652, DSP 0), peak RAM 4.8 GB, wall 3:02.63 |
 | P2 | rdsrv | io_parallel | 1 | 2.78 ns | d8 n32 p1 PF4 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 62 cyc, clock 2.78 -> est 1.842 ns, %SLR LUT 48 FF 14 DSP 0 BRAM 0 (LUT 209124, FF 126339, DSP 0), peak RAM 4.5 GB, wall 2:46.37 |
-| F-k1b | nersc | finalist | 1 | 2.78 ns | d8p1r1 n32: same chain, next interactive slot | waiting for slot | | | | | io_parallel PF4 mlf clones (P2: 48% LUT) |
+| F-k1b | nersc 59155768 | finalist | 1 | 2.78 ns | d8p1r1 n32: same chain | running (started 04:31) | | | | | io_parallel PF4 mlf clones (P2: 48% LUT) |
 | L7b | rdsrv | io_parallel | 1 | 3.125 ns | d8 n16 pipeline style, top II 8, mlf | killed | | | | | skipped after L7a stalled in scheduling |
 | P3 | rdsrv | io_parallel | 2 | 2.78 ns | d16 n32 p1 PF2 mlf clones | done | | | | | II 16 cyc = 44.48 ns, latency 80 cyc, clock 2.78 -> est 1.856 ns, %SLR LUT 97 FF 29 DSP 0 BRAM 0 (LUT 420228, FF 253773, DSP 0), peak RAM 13.0 GB, wall 9:09.12 |
 | P4 | rdsrv | io_parallel | 2 | 2.78 ns | d24 n16 p1 PF1 mlf clones | done | | | | | II 16 cyc = 44.48 ns, latency 84 cyc, clock 2.78 -> est 1.856 ns, %SLR LUT 94 FF 26 DSP 0 BRAM 0 (LUT 408639, FF 228688, DSP 0), peak RAM 8.6 GB, wall 6:02.07 |
@@ -56,5 +56,8 @@ Resources are % of one SLR (432k LUT, 864k FF, 3072 DSP, 1344 BRAM_18K) from csy
 | F-k1c | nersc | finalist | 1 | 2.78 ns | d12p2r1m1 n16 | dropped | | | | | replaced by the k=2 design below |
 | Q2 | rdsrv | io_parallel | 1 | 2.78 ns | d16 n16 m1 PF2 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 103 cyc, clock 2.78 -> est 2.012 ns, %SLR LUT 92 FF 29 DSP 0 BRAM 0 (LUT 399003, FF 252544, DSP 0), peak RAM 6.4 GB, wall 3:55.34 |
 | R1 | rdsrv | io_parallel | 2 | 2.78 ns | d12 n32 p1 PF2 mlf clones | done | | | | | II 16 cyc = 44.48 ns, latency 79 cyc, clock 2.78 -> est 2.029 ns, %SLR LUT 68 FF 21 DSP 0 BRAM 0 (LUT 297869, FF 182983, DSP 0), peak RAM 8.0 GB, wall 5:15.61 |
-| F-k2 | nersc | finalist | 2 | 2.78 ns | d12p1r1 n32: same chain, slot after F-k1b | waiting for slot | | | | | io_parallel PF2 mlf clones (R1: II 16 = 44.5 ns, 68% LUT) |
+| F-k2 | nersc 59156041 | finalist | 2 | 2.78 ns | d12p1r1 n32: same chain | running (started 04:49) | | | | | io_parallel PF2 mlf clones (R1: II 16 = 44.5 ns, 68% LUT) |
 | R2 | rdsrv | io_parallel | 1 | 2.78 ns | d12 n32 p1 PF4 mlf clones | done | | | | | II 8 cyc = 22.24 ns, latency 63 cyc, clock 2.78 -> est 2.029 ns, %SLR LUT 77 FF 22 DSP 0 BRAM 0 (LUT 332925, FF 195684, DSP 0), peak RAM 8.2 GB, wall 5:33.54 |
+| H1 | rdsrv | io_parallel | 1 | 2.78 ns | convert.py on F-k1 export (d8p2r1 n16): PF2 mlf clone-fanout | done | 8 / 22.2 | 59 / 18 / 0 | 1.96 | 0.9653 | **k=1 PASS on all three axes (csynth only)**: bit-exact on 9984 jets, acc 0.9038, 1/eB 79.4, latency 99 cyc = 275 ns. Project hls_prj/deepsets_distillnet_8bit_fullQuant_io_parallel_latency_rf1_pf2_clk2.78_mlf_clone |
+| H1b | rdsrv | io_parallel | 1 | 5 ns | F-k1 export: PF4 mlf clone-fanout (200 MHz) | done | | | | 0.9653 | II 4 cyc = 20 ns, latency 60 cyc, clock 5 -> est 3.646 ns, %SLR LUT 67 FF 15 DSP 0 BRAM 0 (LUT 291997, FF 136689, DSP 0), peak RAM 4.2 GB, wall 2:58.11 |
+| H4 | rdsrv | io_stream | 4 | 4.17 ns | convert.py on F-k4 export (d32p2r1 n16), Resource | done | 20 / 83.4 | 71 / 16 / 37 | 3.04 | 0.9712 | **k=4 PASS on all three axes (csynth only)**: bit-exact on 9984 jets, acc 0.9111, 1/eB 158.8, latency 92 cyc = 384 ns. Project hls_prj/deepsets_distillnet_8bit_fullQuant_io_stream_resource_rf1_clk4.17 |
