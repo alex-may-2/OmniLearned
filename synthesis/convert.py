@@ -43,6 +43,7 @@ BATCH = 64
 p = argparse.ArgumentParser()
 p.add_argument("--onnx", default="onnx_graphs/qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant_clean.onnx")
 p.add_argument("--synth", action="store_true")
+p.add_argument("--clock", type=float, default=5.0, help="target clock period in ns")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
 p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
@@ -55,6 +56,8 @@ _tag = os.path.basename(args.onnx).removesuffix("_clean.onnx").split("_8bit")[-1
 OUT_DIR = f"hls_prj/deepsets_distillnet_8bit{_tag}_{args.io_type}_{args.strategy.lower()}_rf{args.reuse_factor}"
 if args.io_type == "io_parallel":
     OUT_DIR += f"_pf{args.pf}"
+if args.clock != 5:
+    OUT_DIR += f"_clk{args.clock:g}"
 
 # hls4ml bug: Layer._validate_attributes wraps ApplyAlpha's scale/bias_precision in NamedType, and
 # ScaleDownAdd rebuilds ApplyAlpha from those attributes, which update_precision rejects. Unwrap it.
@@ -217,6 +220,7 @@ def convert(hls_cfg):
         backend="Vitis",
         io_type=args.io_type,
         part=PART,
+        clock_period=args.clock,
         hls_config=hls_cfg,
     )
 

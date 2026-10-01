@@ -14,15 +14,19 @@ default       ReLU only, no biases, no tanh (first io_parallel scan):
                   embed  4 -> H Relu DyT -> D                       (H = ratio * D)
                   phi    h + fc2(Quant(Relu(fc1(DyT(h)))))           x --phi-blocks, per particle
                   mean pool, rho blocks (same, post pool) x --rho-blocks, Quant -> Linear -> 2 logits
+              Quant scales, alphas and the 10-bit residual/pool Quants match the r7 graph
+              (onnx_graphs/..._fullQuant_r7_clean.onnx); --res-bits 0 / --no-relu-uint drop the r7-only Quants.
 
 Usage (from synthesis/, on rdsrv409, same env as convert.py):
     python mini_parallel.py --n 16                  # convert + C-sim parity, PF = n (fully parallel)
     timeout 1h python mini_parallel.py --n 16 --synth 2>&1 | tee logs/mini_n16.txt
     python mini_parallel.py --full-quant --n 16 --phi 32,16 --rho 16 --pf 8
     python mini_parallel.py --distillnet --n 32 --pf 2
+    python mini_parallel.py --distillnet --dim 8 --n 16 --pf 4 --mult-limit-fix --clock 2.78   # II-search levers
+    python mini_parallel.py --distillnet --n 32 --io-type io_stream --clock 2.78
 
-Writes hls_prj/mini[_fq|_ds<..>]_n<N>_..._pf<PF>/ (the ONNX graph is saved there as model.onnx). Independent of
-convert.py; the hls4ml patches and the full-quant type settings it needs are copied from there.
+Writes hls_prj/mini[_fq|_ds<..>]_n<N>_..._pf<PF>[_<levers>]/ (the ONNX graph is saved there as model.onnx).
+Independent of convert.py; the hls4ml patches and the full-quant type settings it needs are copied from there.
 """
 
 import argparse
@@ -62,16 +66,30 @@ p.add_argument("--ratio", type=int, default=2, help="--distillnet: mlp_ratio")
 p.add_argument("--phi-blocks", type=int, default=1, help="--distillnet: residual phi blocks after the embed")
 p.add_argument("--rho-blocks", type=int, default=1, help="--distillnet: residual rho blocks")
 p.add_argument("--pf", type=int, default=None, help="ParallelizationFactor of the per-particle layers (default: n)")
+p.add_argument("--res-bits", type=int, default=10, help="--distillnet: bits of the r7 residual-stream/pool Quants (0: none)")
+p.add_argument("--relu-uint", action=argparse.BooleanOptionalAction, default=True, help="--distillnet: r7 unsigned block-ReLU Quants")
+p.add_argument("--no-embed-dyt", action="store_true", help="--distillnet: embed ReLU -> unsigned Quant, no DyT")
+p.add_argument("--io-type", default="io_parallel", choices=["io_parallel", "io_stream"])
+p.add_argument("--clock", type=float, default=5.0, help="target clock period in ns")
+p.add_argument("--rf", type=int, default=1, help="ReuseFactor of the per-particle layers")
+p.add_argument("--mult-limit-fix", action="store_true", help="conv multiplier limit covers all n_pixels of a partition")
+p.add_argument("--dsp-mult", action="store_true", help="bind all multiplies to DSPs (config_op mul -impl dsp)")
+p.add_argument("--pipeline-style", choices=["pipeline", "dataflow"], default=None, help="hls4ml Model PipelineStyle")
 p.add_argument("--synth", action="store_true")
 args = p.parse_args()
 fq = args.full_quant or args.distillnet
 phi = [int(d) for d in args.phi.split(",")]
 rho = [int(d) for d in args.rho.split(",")] if args.rho else []
 pf = args.pf or args.n
+stream = args.io_type == "io_stream"
 if args.distillnet:
     OUT_DIR = f"hls_prj/mini_ds_d{args.dim}r{args.ratio}_phi{args.phi_blocks}_rho{args.rho_blocks}_n{args.n}_pf{pf}"
+    OUT_DIR += f"_q{args.res_bits}{'u' if args.relu_uint else ''}{'_noembdyt' if args.no_embed_dyt else ''}"
 else:
     OUT_DIR = f"hls_prj/mini{'_fq' if fq else ''}_n{args.n}_phi{'-'.join(map(str, phi))}_rho{'-'.join(map(str, rho))}_pf{pf}"
+levers = [(f"rf{args.rf}", args.rf > 1), ("mlf", args.mult_limit_fix), ("dsp", args.dsp_mult)]
+levers += [(str(args.pipeline_style), args.pipeline_style), ("stream", stream), (f"clk{args.clock:g}", args.clock != 5)]
+OUT_DIR += "".join(f"_{tag}" for tag, on in levers if on)
 
 # --- hls4ml patches copied from convert.py (see the comments there) ---
 _update_precision = WeightVariable.update_precision
@@ -216,11 +234,14 @@ def relu(x):
 
 def dyt(x, alpha):
     """Full-quant DynamicTanh: tanh(Quant8(alpha_po2 * x)), output re-quantized by the next Linear's input Quant."""
-    i = count("Mul")
-    nodes.append(helper.make_node("Mul", [x, const(f"alpha_{i}", alpha)], [f"Mul_{i}_out"], name=f"Mul_{i}"))
-    t = quant(f"Mul_{i}_out", TANH_IN_SCALE, 1)
-    nodes.append(helper.make_node("Tanh", [t], [f"Tanh_{i}_out"], name=f"Tanh_{i}"))
-    return quant(f"Tanh_{i}_out", TANH_OUT_SCALE, 1)
+    if alpha != 1:  # a Mul by 1 (r7 embed) makes hls4ml drop the next Quant; without it ReLU + Quant fuse as in r7
+        i = count("Mul")
+        nodes.append(helper.make_node("Mul", [x, const(f"alpha_{i}", alpha)], [f"Mul_{i}_out"], name=f"Mul_{i}"))
+        x = f"Mul_{i}_out"
+    t = quant(x, TANH_IN_SCALE, 1)
+    j = count("Tanh")
+    nodes.append(helper.make_node("Tanh", [t], [f"Tanh_{j}_out"], name=f"Tanh_{j}"))
+    return quant(f"Tanh_{j}_out", TANH_OUT_SCALE, 1)
 
 
 def pool(x):
@@ -234,27 +255,46 @@ def pool(x):
     return "Flatten_out"
 
 
-def residual(h, d, hidden, alpha):
+def relu_quant(x, scale):
+    """Block ReLU and the next Linear's input Quant: unsigned 8-bit like r7 (--relu-uint), else signed 1/16."""
+    return quant(relu(x), scale, 0) if args.relu_uint else quant(relu(x), ACT_SCALE, 1)
+
+
+def res_quant(x, scale):
+    """r7 residual-stream / pool Quant (--res-bits, signed); no Quant with --res-bits 0."""
+    return quant(x, scale, 1, bits=args.res_bits) if args.res_bits else x
+
+
+def residual(h, d, hidden, alpha, relu_scale=ACT_SCALE):
     """Pre-norm residual block: h + fc2(Quant(Relu(fc1(DyT(h)))))."""
     t = matmul(dyt(h, alpha), d, hidden, in_scale=TANH_OUT_SCALE)
-    t = matmul(quant(relu(t), ACT_SCALE, 1), hidden, d, in_scale=ACT_SCALE)
+    t = relu_quant(t, relu_scale)
+    t = matmul(t, hidden, d, in_scale=relu_scale if args.relu_uint else ACT_SCALE)
     i = sum(n.name.startswith("Res_") for n in nodes)
     nodes.append(helper.make_node("Add", [h, t], [f"Res_{i}_out"], name=f"Res_{i}"))
     return f"Res_{i}_out"
 
 
-x = quant("global_in", ACT_SCALE, 1)
+IN_SCALE = 2.0**-5 if args.distillnet else ACT_SCALE  # r7 input Quant: 8-bit, 1/32
+x = quant("global_in", IN_SCALE, 1)
 if args.distillnet:
     d, hidden = args.dim, args.ratio * args.dim
-    # alpha po2 like the trained model: embed 2 (after ReLU), residual-stream norms 8
-    x = matmul(dyt(relu(matmul(x, 4, hidden, in_scale=ACT_SCALE)), 2.0), hidden, d, in_scale=TANH_OUT_SCALE)
+    # Scales and po2 alphas from the r7 graph: embed alpha 1, residual-stream norms 8; block ReLU Quants 1/64 (phi)
+    # and 1/128 (rho); 10-bit residual stream 1/128 (embed out), 1/64 (after each phi block), pool out 1/512.
+    t = relu(matmul(x, 4, hidden, in_scale=IN_SCALE))
+    if args.no_embed_dyt:
+        x = matmul(quant(t, 2.0**-5, 0), hidden, d, in_scale=2.0**-5)
+    else:
+        x = matmul(dyt(t, 1.0), hidden, d, in_scale=TANH_OUT_SCALE)
+    x = res_quant(x, 2.0**-7)
     for _ in range(args.phi_blocks):
-        x = residual(x, d, hidden, 8.0)
+        x = res_quant(residual(x, d, hidden, 8.0, 2.0**-6), 2.0**-6)
     n_pp = count("MatMul")
-    x = pool(x)
+    x = res_quant(pool(x), 2.0**-9)
     for _ in range(args.rho_blocks):
-        x = residual(x, d, hidden, 8.0)
-    matmul(quant(x, ACT_SCALE, 1), d, 2, out="logits", in_scale=ACT_SCALE)
+        x = residual(x, d, hidden, 8.0, 2.0**-7)
+    out_scale = TANH_OUT_SCALE if args.res_bits else ACT_SCALE  # r7: 8-bit 1/128 before the output Linear
+    matmul(quant(x, out_scale, 1), d, 2, out="logits", in_scale=out_scale)
 else:
     s, d = ACT_SCALE, 4
     for d_out in phi:
@@ -282,19 +322,25 @@ model = cleanup_model(ModelWrapper(onnx_path))
 
 # --- convert ---
 cfg = hls4ml.utils.config_from_onnx_model(model, granularity="name", backend="Vitis", default_precision="fixed<16,6>")
-cfg["Model"]["Strategy"] = "Latency"
+strategy = "Resource" if stream else "Latency"  # io_stream: as the r7 io_stream build (convert.py defaults)
+cfg["Model"]["Strategy"] = strategy
+if args.pipeline_style:
+    cfg["Model"]["PipelineStyle"] = args.pipeline_style
 for layer_cfg in cfg["LayerName"].values():
-    layer_cfg["Strategy"] = "Latency"
+    layer_cfg["Strategy"] = strategy
 for i in range(n_pp):  # set on MatMul_<i>: MatmulConstToDense copies it onto the Dense_MatMul_<i> PointwiseConv1D
-    cfg["LayerName"][f"MatMul_{i}"]["ParallelizationFactor"] = pf
+    if not stream:
+        cfg["LayerName"][f"MatMul_{i}"]["ParallelizationFactor"] = pf
+    cfg["LayerName"][f"MatMul_{i}"]["ReuseFactor"] = args.rf
 cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = "fixed<32,16>"  # sum of n 8-bit values
 
 
 def quant_type(node):
-    """ap_fixed type equal to a power-of-2-scale, zero-offset QONNX Quant (signed, not narrow)."""
+    """ap_(u)fixed type equal to a power-of-2-scale, zero-offset, not narrow QONNX Quant."""
     scale = model.get_initializer(node.input[1]).item()
     bits = int(model.get_initializer(node.input[3]).item())
-    return f"fixed<{bits},{bits + int(np.log2(scale))},RND_CONV,SAT>"
+    signed = next((a.i for a in node.attribute if a.name == "signed"), 1)
+    return f"{'' if signed else 'u'}fixed<{bits},{bits + int(np.log2(scale))},RND_CONV,SAT>"
 
 
 def is_quant(node):
@@ -303,7 +349,14 @@ def is_quant(node):
 
 def convert(hls_cfg):
     return hls4ml.converters.convert_from_onnx_model(
-        model, output_dir=OUT_DIR, project_name="mini", backend="Vitis", io_type="io_parallel", part=PART, hls_config=hls_cfg
+        model,
+        output_dir=OUT_DIR,
+        project_name="mini",
+        backend="Vitis",
+        io_type=args.io_type,
+        part=PART,
+        clock_period=args.clock,
+        hls_config=hls_cfg,
     )
 
 
@@ -334,13 +387,36 @@ for layer in hls_model.get_layers():
     if isinstance(layer, ApplyAlpha):  # per-channel, not per-particle broadcast (io_parallel_report.md)
         print(f"[alpha] {layer.name}: n_in={layer.get_attr('n_in')} n_filt={layer.get_attr('n_filt')}")
 
+
+def patch(path, old, new):
+    s = open(path).read()
+    assert old in s, f"{old!r} not in {path}"
+    open(path, "w").write(s.replace(old, new))
+
+
+# Synthesis-only levers, applied to the written project (C-sim is unaffected; build() does not rewrite it)
+if args.mult_limit_fix:
+    # The partition loop is pipelined at II = RF but ALLOCATION caps the multipliers at one pixel's n_in * n_out / RF,
+    # while each iteration does n_pixels = PF pixels: II grew with PF (II 8 at n 16, PF 8; io_parallel_report.md).
+    patch(
+        f"{OUT_DIR}/firmware/nnet_utils/nnet_conv1d_latency.h",
+        "    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::mult_config::multiplier_limit",
+        "    const unsigned mult_limit_all = CONFIG_T::mult_config::multiplier_limit * CONFIG_T::n_pixels;\n"
+        "    #pragma HLS ALLOCATION operation instances=mul limit=mult_limit_all",
+    )
+if args.dsp_mult:
+    clk = "create_clock -period $clock_period -name default"
+    patch(f"{OUT_DIR}/build_prj.tcl", clk, clk + "\nconfig_op mul -impl dsp")
+
 # --- C-sim parity vs qonnx on random inputs (inputs on the 8-bit grid) ---
-xin = (np.round(rng.normal(0, 2, (BATCH, args.n, 4)) / ACT_SCALE) * ACT_SCALE).clip(-8, 8 - ACT_SCALE).astype(np.float32)
+xin = (np.round(rng.normal(0, 2, (BATCH, args.n, 4)) / IN_SCALE) * IN_SCALE).clip(-128 * IN_SCALE, 127 * IN_SCALE).astype(np.float32)
 ref = execute_onnx(model, {"global_in": xin})[model.graph.output[0].name]
 hls = np.asarray(hls_model.predict(np.ascontiguousarray(xin))).reshape(ref.shape)
 print(f"[random] max|dlogit|={np.abs(ref - hls).max():.4g} argmax agree={np.mean(ref.argmax(1) == hls.argmax(1)):.3f}")
 print(f"[model] {OUT_DIR} per-particle MatMuls={n_pp} MACs/jet={args.n * sum(macs[:n_pp]) + sum(macs[n_pp:])}")
 
+if args.synth and np.abs(ref - hls).max() > 0:
+    raise SystemExit("C-sim is not bit-exact: no synthesis")
 if args.synth:
     hls_model.build(csim=False, synth=True, export=False)
     hls4ml.report.read_vivado_report(OUT_DIR)
