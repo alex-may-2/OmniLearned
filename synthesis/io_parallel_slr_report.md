@@ -22,7 +22,8 @@ used by `convert.py`. On that subset r7 scores AUC 0.9744.
 |---|---|---|---|---|---|---|---|---|
 | 1 | 25 ns | d8p2r1, n 16 | io_parallel PF 2, 360 MHz | 8 / 22.2 | 59 / 18 / 0 | 1.96 ns | **0.9653** | pass |
 | 1 | 25 ns | same graph | io_parallel PF 4, 200 MHz | 4 / 20.0 | 67 / 15 / 0 | 3.65 ns | **0.9653** | pass, more timing margin |
-| 2 | 50 ns | any k=1 design (above) | | | | | 0.9653 | pass |
+| 1 | 25 ns | same graph | io_parallel PF 2, 320 MHz | 8 / 25.0 | 57 / 17 / 0 | 2.28 ns | **0.9653** | pass |
+| 2 | 50 ns | d8p2r1, n 16 (same graph) | io_parallel PF 1, 360 MHz | 16 / 44.5 | 55 / 17 / 0 | 1.96 ns | **0.9653** | pass |
 | 2 | 50 ns | d12p1r1, n 32 (training) | io_parallel PF 2, 360 MHz | 16 / 44.5 (random weights) | 68 / 21 / 0 | 2.03 ns | pending | training (export ~07:50) |
 | 4 | 100 ns | d32p2r1, n 16 (r7 width) | io_stream, 240 MHz | 20 / 83.4 | 71 / 16 / 37 | 3.04 ns | **0.9712** | pass |
 
