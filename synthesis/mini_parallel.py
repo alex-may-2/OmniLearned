@@ -331,7 +331,7 @@ if fq:  # exact types, as convert.py sets them for the full-quant graph
 hls_model = convert(cfg)
 hls_model.compile()
 for layer in hls_model.get_layers():
-    if isinstance(layer, ApplyAlpha):  # item 3 of io_parallel_report.md: per-channel, not per-particle broadcast
+    if isinstance(layer, ApplyAlpha):  # per-channel, not per-particle broadcast (io_parallel_report.md)
         print(f"[alpha] {layer.name}: n_in={layer.get_attr('n_in')} n_filt={layer.get_attr('n_filt')}")
 
 # --- C-sim parity vs qonnx on random inputs (inputs on the 8-bit grid) ---
