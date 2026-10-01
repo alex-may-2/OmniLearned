@@ -5,3 +5,4 @@ hls_prj/
 *.npz
 convert_log.txt
 synth_log.txt
+synthesis/top_test_10k_n64.npz
