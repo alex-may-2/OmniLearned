@@ -46,6 +46,12 @@ Real-jet test set: `top_test_10k_n64.npz` (in this directory, and on Perlmutter 
 - `y`: int `[10000]` labels (5080 / 4920).
 - Evaluated in batches of 64 (9984 jets = 156 full batches).
 
+Full test set: `top_test_full_n64.npz` (gitignored, 417 MB; also in the Perlmutter qonnx directory).
+
+- `x`: float32 `[404000, 64, 4]`, `data[:, :64]` of `/global/cfs/cdirs/m4567/www/top/test/test_ttbar.h5`
+  (no clipping, same as the 10k file, whose rows are its first 10000). `y`: int64 `[404000]`.
+- On 9984 jets, 1/eB at eS = 0.3 / 0.5 rests on only ~15 / ~30 background jets. Use the full set to rank models.
+
 ## Environment
 
 - **rdsrv409:** conda env `/u1/alexmay/conda/envs/omnilearned-hls` (Python 3.11).
@@ -111,6 +117,17 @@ each other. The graph suffix is the part of the file name after `_8bit`, e.g. `_
   reports in the same directory.
 - The full hls4ml config used is saved as `<project>/hls4ml_config.yml`.
 - `hls_prj/` and `logs/` are gitignored.
+
+Full-test-set forward pass of a built project's C-sim library (io_parallel or io_stream; no hls4ml or Vitis needed):
+
+```bash
+python csim_forward.py hls_prj/<project> [--npz top_test_full_n64.npz]
+```
+
+- It reruns the project's `build_lib.sh` first: the library bakes in the absolute weights path, which a
+  project rename breaks.
+- It prints acc, AUC and 1/eB at eS = 0.3, 0.5, 0.7, and saves the logits as `<project>/csim_forward_<npz>.npz`.
+- One core, about 50 s for 404k jets at n = 16 (io_parallel), a few minutes at n = 64 (io_stream).
 
 ### `convert.py` config
 
@@ -308,6 +325,35 @@ Full-quant follow-up (2026-09-29, `mini_parallel.py --full-quant / --distillnet`
 - For 64 particles, use io_stream.
 
 Full write-up, including io_stream L1T estimates: `io_parallel_report.md`.
+
+## Full test set comparison (2026-10-01)
+
+All 404k test jets (`top_test_full_n64.npz`). HLS rows are `csim_forward.py` C-sim, i.e. the exact
+hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quant QAT in torch.
+
+| model | N | run as | acc | AUC | 1/eB @ eS=0.3 | @ 0.5 | @ 0.7 |
+|---|---|---|---|---|---|---|---|
+| twamorka `distill_top_deepsets_distillnet_fpga_a05_T4` (d32p2r1, float) | 64 | float | 0.9253 | 0.9786 | 706 | 190 | 58.6 |
+| r7 (same model, full-quant QAT) | 64 | HLS | 0.9205 | 0.9757 | 540 | 143 | 47.7 |
+| d12p2r1m1 float KD (`ps_d12p2r1m1_n16_e50`) | 16 | float | - | 0.9731 | 377 | 119 | 43.4 |
+| **H1g** d12p2r1m1 full-quant (k=1 winner) | 16 | HLS | 0.9106 | **0.9697** | 278 | 91.5 | 35.7 |
+| d8p2r1 float KD (`ps_d8p2r1_n16_e50`) | 16 | float | - | 0.9685 | 274 | 88.1 | 33.0 |
+| twamorka `qat_top_deepsets_mac_d8p2r1_n16_a05_T4_8bit_po2` | 16 | Brevitas | 0.9086 | 0.9677 | 262 | 85.3 | 31.4 |
+| H1r d8p2r1 full-quant (previous k=1 winner) | 16 | HLS | 0.9074 | 0.9666 | 234 | 78.1 | 30.0 |
+
+- Rejection falls much faster than AUC. From the float d32 n64 model to H1g, AUC drops 0.009 and
+  1/eB at eS=0.5 roughly halves (190 to 91.5).
+- Shrinking costs more than quantizing. d32 n64 float to d12 n16 float costs 37% of 1/eB@0.5;
+  8-bit full-quant then costs another 23%.
+- The twamorka mac checkpoint uses the partial recipe of the first QAT graph (weights and Linear inputs
+  only; DyT, residual and pool in float). It beats H1r (same shape) in software but has no HLS number,
+  and that recipe was not bit-exact in HLS. Its `po2` option is not recorded in `arch_config`.
+- r7's input `Quant` (8-bit, 1/32) saturates at 3.97, so log pT / log E above that (typical values ~5)
+  are clipped. H1g learned 1/16 (range +-8). Not measured how much this costs r7.
+- Scripts for the non-HLS rows are outside the repo on Perlmutter, in
+  `/pscratch/sd/a/alexmay/omnilearned/logs/ps/`: `eval_float_ckpt.py`, `eval_qat_ckpt.py`
+  (strict-loads a non-full-quant QAT checkpoint from its `arch_config`), `qonnx_forward.py` (128-process
+  QONNX run on a CPU node).
 
 ## Next steps
 
