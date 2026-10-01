@@ -166,6 +166,8 @@ QAT costs about 0.003 AUC.
 
 - Branch `parallel-search`, created from `synthesis`.
 - Commit and push only to sync code between rdsrv and nersc. Remote: `git@github.com:alex-may-2/OmniLearned.git`.
+- rdsrv's `origin` is HTTPS and cannot push. Push from rdsrv with agent forwarding:
+  `ssh -A rdsrv 'cd /u1/alexmay/working/OmniLearned && git push git@github.com:alex-may-2/OmniLearned.git <branch>'`.
 - Never merge into `synthesis` (or `parallelize`).
 
 **Run log**
