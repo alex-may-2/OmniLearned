@@ -11,8 +11,9 @@ Usage (from synthesis/; C-sim also runs on Perlmutter, --synth only on rdsrv409)
     python convert.py --io-type io_parallel --strategy Latency --pf 16 2>&1 | tee logs/convert_parallel_pf16.txt
     timeout 1h python convert.py --io-type io_parallel --strategy Latency --pf 16 --synth 2>&1 | tee logs/synth_parallel_pf16.txt
 
-Each graph + option set writes its own project, hls_prj/deepsets_distillnet_8bit[<graph suffix>]_<io>_<strategy>_rf<N>[_pf<N>],
-so runs never overwrite each other.
+Each graph + option set writes its own project, hls_prj/deepsets_<stem>_<io>_<strategy>_rf<N>[_pf<N>][_clk..][_mlf]...
+<stem> is --name if given (e.g. ps_d12p2r1m1_n16), else distillnet_8bit[<graph suffix>]. Every full-quant graph has
+the same suffix, so give --name for any graph other than r7, or projects of different graphs overwrite each other.
 
 The monkeypatches below work around hls4ml bugs hit by this graph (hls4ml fork qibin2020@1d85133).
 """
@@ -53,11 +54,12 @@ p.add_argument("--reuse-factor", type=int, default=1)
 p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
 # io_parallel only: particles processed in parallel by the per-particle layers (divisor of 64; 64 = fully unrolled)
 p.add_argument("--pf", type=int, default=16)
+p.add_argument("--name", help="project stem: hls_prj/deepsets_<name>_<io>_... (e.g. ps_d12p2r1m1_n16)")
 args = p.parse_args()
 
 # The original 8-bit graph keeps its old project names; other graphs get a suffix from their file name.
 _tag = os.path.basename(args.onnx).removesuffix("_clean.onnx").split("_8bit")[-1]
-OUT_DIR = f"hls_prj/deepsets_distillnet_8bit{_tag}_{args.io_type}_{args.strategy.lower()}_rf{args.reuse_factor}"
+OUT_DIR = f"hls_prj/deepsets_{args.name or 'distillnet_8bit' + _tag}_{args.io_type}_{args.strategy.lower()}_rf{args.reuse_factor}"
 if args.io_type == "io_parallel":
     OUT_DIR += f"_pf{args.pf}"
 if args.clock != 5:

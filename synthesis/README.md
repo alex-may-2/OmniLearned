@@ -109,9 +109,13 @@ python mini_parallel.py --distillnet --n 32 --dim 16 --pf 2 [--phi-blocks 1 --rh
 
 Distillnet-topology synths need ~30 GB at n x dim = 512 and more than 55 GB at 1024. Run those alone.
 
-Each graph and option set writes its own project,
-`hls_prj/deepsets_distillnet_8bit[<graph suffix>]_<io>_<strategy>_rf<N>[_pf<N>]`, so runs never overwrite
-each other. The graph suffix is the part of the file name after `_8bit`, e.g. `_fullQuant`.
+Each graph and option set writes its own project, `hls_prj/deepsets_<stem>_<io>_<strategy>_rf<N>[_pf<N>][_clk<ns>][_mlf][_clone][_dsp]`.
+
+- `<stem>` is `--name` if given, else `distillnet_8bit<graph suffix>` (the part of the file name after `_8bit`, e.g. `_fullQuant`).
+- All full-quant graphs share the suffix `_fullQuant`, so without `--name` a second graph overwrites the first one's project.
+  Pass `--name` for every graph except r7. Convention: the training save tag without `qat_` and the epoch, e.g.
+  `--name ps_d12p2r1m1_n16` gives `hls_prj/deepsets_ps_d12p2r1m1_n16_io_parallel_latency_rf1_pf2_clk2.78_mlf_clone`.
+- Projects made before `--name` existed were renamed by hand (e.g. `deepsets_ps_d12p2r1m1_n16_io_parallel_pf2_clk2.78_mlf_clone`).
 
 - Synthesis report: `<project>/deepsets_prj/solution1/syn/report/deepsets_csynth.rpt`, with per-layer
   reports in the same directory.

@@ -1,6 +1,6 @@
 # II ≈ 25 ns search for the full-quant DeepSets (2026-09-30/10-01, rdsrv409 + NERSC)
 
-Plan: `synthesis/PARALLEL_SEARCH_PLAN.md`. Run log, one row per run: `synthesis/parallel_search_log.md`.
+Run log, one row per run: `synthesis/parallel_search_log.md`.
 
 **Requirement.** L1T needs one jet every 25 ns. k copies of the tagger take turns on jets, one copy per SLR, so each
 copy needs II ≤ 25·k ns. II ns = II cycles × clock period.
