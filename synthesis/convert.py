@@ -18,6 +18,7 @@ The monkeypatches below work around hls4ml bugs hit by this graph (hls4ml fork q
 
 import argparse
 import importlib
+from pathlib import Path
 
 import hls4ml
 import numpy as np
@@ -40,6 +41,7 @@ BATCH = 64
 
 p = argparse.ArgumentParser()
 p.add_argument("--synth", action="store_true")
+p.add_argument("--onnx", default=ONNX)
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
 p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
@@ -47,7 +49,9 @@ p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"]
 p.add_argument("--pf", type=int, default=16)
 args = p.parse_args()
 
-OUT_DIR = f"hls_prj/deepsets_distillnet_8bit_{args.io_type}_{args.strategy.lower()}_rf{args.reuse_factor}"
+# Graph variant tag, e.g. "_fullQuant_r7" (empty for the default graph, keeping the old project names)
+TAG = Path(args.onnx).stem.removeprefix(Path(ONNX).stem.removesuffix("_clean")).removesuffix("_clean")
+OUT_DIR = f"hls_prj/deepsets_distillnet_8bit{TAG}_{args.io_type}_{args.strategy.lower()}_rf{args.reuse_factor}"
 if args.io_type == "io_parallel":
     OUT_DIR += f"_pf{args.pf}"
 
@@ -150,7 +154,7 @@ def _parse_onnx_drop_pool_transpose(onnx_model):
 
 onnx_to_hls.parse_onnx_model = _parse_onnx_drop_pool_transpose
 
-model = ModelWrapper(ONNX)
+model = ModelWrapper(args.onnx)
 model = cleanup_model(model).transform(GemmToMatMul())
 model = cleanup_model(model)
 
