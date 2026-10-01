@@ -21,6 +21,7 @@ import argparse
 import copy
 import importlib
 import os
+import re
 
 import hls4ml
 import numpy as np
@@ -45,6 +46,7 @@ p.add_argument("--onnx", default="onnx_graphs/qat_top_deepsets_distillnet_fpga_a
 p.add_argument("--synth", action="store_true")
 p.add_argument("--clock", type=float, default=5.0, help="target clock period in ns")
 p.add_argument("--mult-limit-fix", action="store_true", help="io_parallel: conv multiplier limit covers all PF pixels")
+p.add_argument("--clone-fanout", action="store_true", help="io_parallel: one copy per reader of each residual skip array")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
 p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
@@ -61,6 +63,8 @@ if args.clock != 5:
     OUT_DIR += f"_clk{args.clock:g}"
 if args.mult_limit_fix:
     OUT_DIR += "_mlf"
+if args.clone_fanout:
+    OUT_DIR += "_clone"
 
 # hls4ml bug: Layer._validate_attributes wraps ApplyAlpha's scale/bias_precision in NamedType, and
 # ScaleDownAdd rebuilds ApplyAlpha from those attributes, which update_precision rejects. Unwrap it.
@@ -165,6 +169,7 @@ model = ModelWrapper(args.onnx)
 model = cleanup_model(model).transform(GemmToMatMul())
 model = cleanup_model(model)
 N_PART = model.get_tensor_shape(model.graph.input[0].name)[1]  # particles per jet (64 for r7)
+BATCH = model.get_tensor_shape(model.graph.input[0].name)[0]  # graph batch (64 for the QAT exports)
 
 cfg = hls4ml.utils.config_from_onnx_model(
     model, granularity="name", backend="Vitis", default_precision="fixed<16,6>", default_reuse_factor=args.reuse_factor
@@ -265,6 +270,47 @@ if args.mult_limit_fix:  # synthesis-only, see mini_parallel.py: II = n_partitio
     assert old in src
     open(f, "w").write(src.replace(old, "    const unsigned mult_limit_all = CONFIG_T::mult_config::multiplier_limit * "
                                    "CONFIG_T::n_pixels;\n    #pragma HLS ALLOCATION operation instances=mul limit=mult_limit_all"))
+
+
+def clone_fanout(cpp, top):
+    """Copied from mini_parallel.py. io_parallel residuals: the skip array of each Add is also read by the DyT branch. A DATAFLOW array with two
+    readers is not a channel, so Vitis chains the producer into both consumers (pool 3.0 ns + alpha/Quant 2.8 ns in
+    one cycle, misses 5 ns). Give each reader its own copy through a clone process, as hls4ml does for io_stream."""
+    src = open(cpp).read()
+    lines = src.split("\n")
+    decl = {m[1]: (m[0], m[2]) for m in re.findall(r"^\s*(\w+) (layer\w+)\[([^\]]+)\];", src, re.M)}
+    alias = dict(re.findall(r"auto& (layer\w+) = (layer\w+);", src))
+    calls = [i for i, l in enumerate(lines) if l.strip().startswith("nnet::")]
+    args = lambda l: [a.strip() for a in l[l.index(">(") + 2 : l.rindex(");")].split(",")]
+    n = 0
+    for i in [i for i in calls if lines[i].strip().startswith("nnet::add<")]:
+        skip = args(lines[i])[0]
+        readers = [j for j in calls if j != i and skip in args(lines[j])[: 1]]
+        if not readers:
+            continue
+        t, size = decl[alias.get(skip, skip)]
+        a, b = f"{skip}_cpa", f"{skip}_cpb"
+        j = readers[0]
+        lines[j] = lines[j].replace(f"({skip},", f"({a},", 1)
+        lines[i] = lines[i].replace(f"({skip},", f"({b},", 1)
+        lines[j] = (
+            f"    {t} {a}[{size}];\n    #pragma HLS ARRAY_PARTITION variable={a} complete dim=0\n"
+            f"    {t} {b}[{size}];\n    #pragma HLS ARRAY_PARTITION variable={b} complete dim=0\n"
+            f"    ps_clone<{t}, {size}>({skip}, {a}, {b});\n" + lines[j]
+        )
+        n += 1
+    clone = (
+        "template <class T, int N> void ps_clone(T src[N], T a[N], T b[N]) {\n    #pragma HLS PIPELINE\n"
+        "    for (int i = 0; i < N; i++) {\n        #pragma HLS UNROLL\n        a[i] = src[i];\n        b[i] = src[i];\n    }\n}\n\n"
+    )
+    out = "\n".join(lines)
+    k = out.index(f"void {top}(")
+    open(cpp, "w").write(out[:k] + clone + out[k:])
+    print(f"[clone] {n} fan-out arrays split in {cpp}")
+
+
+if args.clone_fanout:
+    clone_fanout(f"{OUT_DIR}/firmware/deepsets.cpp", "deepsets")
 
 
 def run_both(x):

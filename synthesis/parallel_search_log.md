@@ -26,6 +26,7 @@ Resources are % of one SLR (432k LUT, 864k FF, 3072 DSP, 1344 BRAM_18K) from csy
 | L2c | rdsrv | io_parallel | 1 | 5 ns | L2b + pool output register | queued | | | | | |
 | M1-M4 | rdsrv | io_parallel | 1 | 2.78 ns | L6b + p1 / r0 / ratio 1 / no embed DyT | queued | | | | | model knobs (re-planned on L6b) |
 | B1-B5 | rdsrv | io_parallel | 1-2 | 2.78 ns | d12n16 PF2, d8n32 PF4 (k=1); d16n8 PF1 (k=1); d16n16 PF1, d12n16 PF1 (k=2) | queued | | | | | Phase 1b at 360 MHz |
-| T4 | rdsrv | io_stream | 4 | 3.125 ns | mini ds d32 n24 --strategy Latency | queued | | | | | |
-| T5 | rdsrv | io_stream | 4 | 4.17 ns | mini ds d32 n16 | queued | | | | | k=4 at 240 MHz |
+| T4 | rdsrv | io_stream | 4 | 3.125 ns | mini ds d32 n24 --strategy Latency | done | 32 / 99.8 | 115 / 20 / 5 | 2.28 | | meets II and clock but mults went to LUT (500k). T6 adds --dsp-mult |
+| T5 | rdsrv | io_stream | 4 | 4.17 ns | mini ds d32 n16 | done | 20 / 83.4 | 82 / 21 / 81 | 3.04 | | k=4 PASS (csynth only); LUT 82% > 80% target; n 20 would give II 24 = 100 ns |
 | L6c | rdsrv | io_parallel | 1 | 3.125 ns | L6a with fan-out clones | done | 8 / 25.0 | 58 / 17 / 0 | 2.28 | | k=1 PASS at 320 MHz too (254k LUT). ~25 min of rdsrv idle after it (stuck queue waiter, fixed) |
+| T6 | rdsrv | io_stream | 4 | 3.125 ns | T4 + --dsp-mult | queued | | | | | |
