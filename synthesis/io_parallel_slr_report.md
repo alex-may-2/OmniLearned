@@ -24,19 +24,22 @@ used by `convert.py`. On that subset r7 scores AUC 0.9744.
 | 1 | 25 ns | same graph | io_parallel PF 4, 200 MHz | 4 / 20.0 | 67 / 15 / 0 | 3.65 ns | **0.9653** | pass, more timing margin |
 | 1 | 25 ns | same graph | io_parallel PF 2, 320 MHz | 8 / 25.0 | 57 / 17 / 0 | 2.28 ns | **0.9653** | pass |
 | 2 | 50 ns | d8p2r1, n 16 (same graph) | io_parallel PF 1, 360 MHz | 16 / 44.5 | 55 / 17 / 0 | 1.96 ns | **0.9653** | pass |
-| 2 | 50 ns | d12p1r1, n 32 (training) | io_parallel PF 2, 360 MHz | 16 / 44.5 (random weights) | 68 / 21 / 0 | 2.03 ns | pending | training (export ~07:50) |
+| 2 | 50 ns | d12p1r1, n 32 | io_parallel PF 2, 360 MHz | 16 / 44.5 | 74 / 26 / 0 | 2.03 ns | 0.9566 | fits, but loses to the d8p2r1 n16 build above |
 | 4 | 100 ns | d32p2r1, n 16 (r7 width) | io_stream, 240 MHz | 20 / 83.4 | 71 / 16 / 37 | 3.04 ns | **0.9712** | pass |
 
 - **k=1 meets all three axes:**
   - II ≤ 25 ns with one copy in one SLR;
   - AUC 0.9653 ≥ 0.9644;
   - latency 99 cycles = 275 ns at 360 MHz (60 cycles = 300 ns at 200 MHz).
+- **k=2 gains nothing over k=1.** A slower II does not shrink the elementwise cost, and the larger k=2-only shape
+  (d12p1r1 n32, no phi block) trains worse. The best k=2 design is the k=1 graph at PF 1 (55% LUT, AUC 0.9653).
 - **k=4 gives up 3 SLRs for +0.006 AUC:** io_stream keeps the r7 width; latency 384 ns.
-- **Extra finalist d8p1r1 n32** (k=1, 48% LUT at random weights) is still training: export ~07:10.
+- **Extra finalist d8p1r1 n32 (no residual phi block, 32 particles)** fits k=1 (II 22.2 ns, 51% LUT) but reaches only AUC 0.9532. Dropping the phi block costs about 0.005 AUC in float (0.9631 vs 0.9685) and loses more in QAT (about 0.01). The 9-epoch screens did not show this.
 - **What made io_parallel work:**
   1. `--mult-limit-fix` (II = n/PF);
   2. fan-out clones (timing);
-  3. a 360 MHz clock with PF = n/8, which gives fewer multipliers than 200 MHz with PF = n/5.
+  3. a fast clock: at 360 MHz, PF 2 (8 cycles) needs half the parallel multipliers of PF 4 at 200 MHz (4 cycles),
+     so it uses 59% vs 67% LUT.
 
 ## 1. r7 mirror (Phase 0)
 
@@ -90,7 +93,7 @@ Two conversion details had to change:
 
 | run | knob | LUT | vs L6b (263k) | keep? |
 |---|---|---|---|---|
-| M1 | p1: no residual phi block | 115k | −56% | yes, `--size d<dim>p1r1`, no code |
+| M1 | p1: no residual phi block | 115k | −56% | hardware yes (`--size d<dim>p1r1`, no code), but costs ~0.012 AUC after full training (§5) |
 | M3 | mlp_ratio 1 | 173k | −34% | yes, new size suffix `d<dim>p<p>r<r>m1` (nersc `utils.py`, +2 lines) |
 | M2 | r0: no rho block | 244k | −7% | no |
 | M4 | no embed DyT | 251k | −5% | no |
@@ -117,8 +120,10 @@ Short screens trained 9 epochs on 1 GPU each (compare within this table only):
 | d8p1r1 n32 | 0.9474 |
 | d12p2r1m1 n16 | 0.9511 |
 
-At this training length the knobs cost no measurable AUC, so p1 and m1 buy hardware room for free. Whether the bigger
-shapes they allow gain AUC after full training is what the extra finalists test.
+At 9 epochs the knobs showed no AUC cost, **but full training disagrees for p1**: d8p1r1 n32 reaches QAT AUC 0.9532
+vs 0.9653 for d8p2r1 n16. Short single-GPU screens are too noisy and too undertrained to rank architectures; use
+them only as a smoke test. mlp_ratio 1 (m1) has not been fully trained yet. It is the knob to try next, because it
+keeps the phi block.
 
 ## 4. io_stream (k=4)
 
@@ -137,15 +142,15 @@ shapes they allow gain AUC after full training is what the extra finalists test.
 
 ## 5. Accuracy
 
-| model | float screen (full test, 404k jets) | QAT = HLS AUC (9984 jets) | acc | 1/eB at eS 0.5 |
+| model | float AUC (full test, 404k jets) | QAT = HLS AUC (9984 jets) | acc (QAT) | 1/eB at eS 0.5 (QAT) |
 |---|---|---|---|---|
 | r7 (d32p2r1 n64) | — | 0.9744 | 0.9173 | 123.9 |
 | d32p2r1 n64, 20 ep, 1 node (control) | 0.9708 | — | 0.9151 | 89.8 |
 | d8p2r1 n16, 20 ep (screen) | 0.9672 | — | 0.9074 | 83.4 |
-| **d8p2r1 n16, 50 ep + QAT (k=1)** | — | **0.9653** | 0.9038 | 79.4 |
-| **d32p2r1 n16, 50 ep + QAT (k=4)** | — | **0.9712** | 0.9111 | 158.8 |
-| d8p1r1 n32 (k=1 extra) | — | pending | | |
-| d12p1r1 n32 (k=2) | — | pending | | |
+| **d8p2r1 n16, 50 ep + QAT (k=1)** | 0.9685 | **0.9653** | 0.9038 | 79.4 |
+| **d32p2r1 n16, 50 ep + QAT (k=4)** | 0.9755 | **0.9712** | 0.9111 | 158.8 |
+| d8p1r1 n32, 50 ep + QAT (k=1 extra) | 0.9631 | 0.9532 | 0.8930 | 37.4 |
+| d12p1r1 n32, 50 ep + QAT (k=2 extra) | 0.9662 | 0.9566 | 0.8933 | 43.1 |
 
 - The control is 0.006 below the fully trained 0.9770, so 20-epoch single-node screens undertrain by about that much.
 - The QAT AUC comes from the exported QONNX graph via `convert.py`. `qat_deepsets_eval.py` is not used, because it
@@ -159,7 +164,16 @@ shapes they allow gain AUC after full training is what the extra finalists test.
 - Vivado synthesis and place-and-route (csynth timing only).
 - Pipeline-style operator sharing (top-level II = C) was tried but did not finish scheduling (L7).
 
-## 7. Reproduce
+## 7. Next steps
+
+1. **Vivado synthesis and place-and-route of the k=1 design** at 360 MHz (and the 200 MHz fallback), with a pblock
+   on one SLR. csynth estimates 1.96 ns against 2.78 ns, but at 59% LUT the routed timing is the real question.
+2. **Full training of the mlp_ratio-1 shape d12p2r1m1 n16** (k=1, 63% LUT). It keeps the phi block, which p1
+   showed matters. Use `--size d12p2r1m1`; the suffix is already on the branch.
+3. **Real-weight `--dsp-mult`** on the k=1 build: −11% LUT at random weights.
+4. **The round-robin distributor and merger** if k > 1 is ever used.
+
+## 8. Reproduce
 
 Training (nersc, branch `parallel-search`; on gpu_interactive, wrap the line in
 `salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 --gpus-per-node 4 -A m3246 bash scripts/ps_final.sbatch`):
