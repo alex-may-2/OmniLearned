@@ -164,12 +164,12 @@ Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 Training (nersc, branch `synthesis`, on gpu_interactive):
 
 ```
-SIZE=d12p2r1m1 N=16 setsid nohup salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 \
-    --gpus-per-node 4 -A m3246 bash scripts/ps_final.sbatch > <log> 2>&1 < /dev/null &
+SIZE=d12p2r1m1 N=16 FLOAT_TAG=ps_d12p2r1m1_n16_e50 setsid nohup salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 \
+    --gpus-per-node 4 -A m3246 bash scripts/fullquant_chain.sbatch > <log> 2>&1 < /dev/null &
 # -> qonnx/fpga/qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx
 ```
 
-`ps_final.sbatch` runs three stages:
+`fullquant_chain.sbatch` (formerly `ps_final.sbatch`) runs three stages:
 1. float KD: top_deepsets_distillnet_fpga recipe, `--act-layer relu --deepsets-fixed-n N`, 50 epochs on 1 node;
 2. `qat_deepsets.py` (always full-quant; its defaults are `--tanh-in-max 4 --res-bits 10 --relu-uint`), 15 epochs at 5e-5;
 3. `qat_deepsets_export_qonnx.py --tag <qat_tag>` (shape and quant settings come from the checkpoint's `arch_config`).
