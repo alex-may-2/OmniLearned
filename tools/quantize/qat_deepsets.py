@@ -14,24 +14,63 @@ this file so importing the shared `omnilearned` package elsewhere (e.g. the
 omnilearned-clean env used by ongoing training jobs, which doesn't have
 Brevitas installed) is completely unaffected.
 
-Must be run with the omnilearned-fpga/env python (has Brevitas/QONNX/hls4ml;
-omnilearned-clean/env does not).
+QAT is always full-quant: power-of-2 weight/activation scales, Int16 biases,
+QuantDynamicTanh (gamma folded, po2 alpha), and by default a fixed tanh input
+range (--tanh-in-max 4), a quantized residual stream and pool (--res-bits 10)
+and unsigned inputs after ReLU (--relu-uint). Every op between Quant nodes is
+then exact in fixed point, so the exported QONNX graph is bit-exact in hls4ml.
 
-Usage:
-    /global/homes/t/twamorka/omnilearned-fpga/env/bin/python qat_deepsets.py \
-        --tag distill_top_deepsets_distillnet_scratch_a05_T4 \
-        --size distillnet --bits 8 \
-        --save-tag qat_top_deepsets_distillnet_a05_T4_8bit \
-        --epochs 15 --lr 5e-5
+Workflow
+--------
+1. Float KD training (omnilearned train) of a fixed-N ReLU DeepSets student:
+   --arch deep-sets --size <size> --act-layer relu --deepsets-fixed-n <N>
+   --distill ... --save-tag <float_tag>. Full-quant needs the fixed-N body.
+2. QAT (this script): warm-starts from <float_tag>, writes <qat_tag>.
+3. QONNX export: qat_deepsets_export_qonnx.py --tag <qat_tag>
+   Test-set eval: qat_deepsets_eval.py --tag <qat_tag>
+   Both rebuild the model from the QAT checkpoint's arch_config; no shape flags.
 
-For a checkpoint trained with the optional message-passing block, pass the
-SAME --num-interaction-layers / --interaction-k the float run used so the
-architecture (and its state_dict keys) match before restore, e.g.:
-    ... --tag distill_top_deepsets_distillnet_scratch_a05_T4_gnn1_k64 \
-        --num-interaction-layers 1 --interaction-k 64
+Inputs and outputs
+------------------
+--tag <float_tag>      float checkpoint to start from: <--init-dir>/best_model_<float_tag>.pt
+--save-tag <qat_tag>   QAT checkpoint written to <--output-dir>/best_model_<qat_tag>.pt
+                       (plus last_model_* and training_*.json)
+--init-dir/--output-dir default to /pscratch/sd/t/twamorka/omnilearned/checkpoints/.
+
+The model shape is read from the float checkpoint's arch_config, which train.py
+saves. A float checkpoint saved before arch_config existed (e.g.
+distill_top_deepsets_distillnet_fpga_a05_T4) stops with an error unless you pass
+--size, --deepsets-fixed-n and, if not relu, --act-layer.
+
+The KD recipe defaults (--distill-alpha 0.5 --distill-beta 0.5 --distill-t 4,
+teacher fine_tune_top_l) and the schedule defaults (15 epochs, lr 5e-5, wd 0.5,
+1000 iterations/epoch) are the ones every full-quant graph so far used.
+
+Examples
+--------
+Float checkpoint with arch_config (any train.py run since arch_config was added):
+    python tools/quantize/qat_deepsets.py \
+        --tag ps_d12p2r1m1_n16_e50 \
+        --save-tag qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant
+
+Older float checkpoint without arch_config (the distillnet student, N = 64):
+    python tools/quantize/qat_deepsets.py \
+        --tag distill_top_deepsets_distillnet_fpga_a05_T4 \
+        --size distillnet --deepsets-fixed-n 64 \
+        --save-tag qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant
+
+Multi-GPU (one node, 4 GPUs, ~1 h for d12 N=16) from the repo root, inside an
+allocation such as
+salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 --gpus-per-node 4 -A m3246:
+    srun bash -c "source scripts/export_ddp.sh; python tools/quantize/qat_deepsets.py --tag ... --save-tag ..."
+scripts/qat_train_deepsets_distillnet_fpga_8bit.sh is a ready-made launcher for
+the distillnet example.
+
+Use the omnilearned-fpga env's python (it has Brevitas); "python" above means that one.
 """
 
 import argparse
+import math
 import os
 
 import torch
@@ -41,6 +80,7 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from pytorch_optimizer import Lion
 
 from omnilearned.dataloader import load_data
+from omnilearned.layers import DynamicTanh
 from omnilearned.network import DeepSets, ACT_LAYERS
 from omnilearned.train import train_model
 from omnilearned.utils import (
@@ -57,7 +97,132 @@ DATA_PATH = "/global/cfs/cdirs/m4567/www/"
 TEACHER_DIR_L = "/pscratch/sd/t/twamorka/omnilearned/teacher_logits/companion_fine_tune_top_l"
 
 
-def wrap_linears_qat(model, weight_bits, act_bits):
+def dyt_linear_pairs(model):
+    """(DynamicTanh, the Linear it feeds) for every DeepSets norm. Uses module
+    paths, so call it on the float model before wrapping."""
+    body, head = model.body, model.classifier
+    pairs = [(body.embed.norm, body.embed.fc2)]
+    pairs += [(n, blk.fc1) for n, blk in zip(body.phi_norms, body.phi_blocks)]
+    pairs += [(n, blk.fc1) for n, blk in zip(head.rho_norms, head.rho)]
+    return pairs
+
+
+@torch.no_grad()
+def fold_dyt_gamma(model):
+    """Fold each DynamicTanh's per-channel gamma into the input columns of the
+    Linear it feeds: W @ (gamma * t) == (W * gamma) @ t. Removes the gamma Mul
+    from the exported graph (one fewer float op for hls4ml, and fewer
+    multipliers). Float warm-start only; the full-quant wrap drops gamma."""
+    for norm, lin in dyt_linear_pairs(model):
+        lin.weight.mul_(norm.weight[None, :])
+        norm.weight.fill_(1.0)
+    # The embed norm sits after ReLU(fc1), and ReLU is positively homogeneous, so the
+    # po2 rounding of its alpha can be absorbed exactly into fc1. Without this,
+    # 0.77 -> 1 alone drops accuracy from 0.93 to 0.74. phi/rho norms see the
+    # residual stream, so their rounding (7.8, 9.6 -> 8) is left to QAT.
+    embed = model.body.embed
+    if isinstance(embed.act, nn.ReLU):
+        a = embed.norm.alpha
+        a_po2 = torch.pow(2.0, torch.round(torch.log2(a)))
+        embed.fc1.weight.mul_(a / a_po2)
+        embed.fc1.bias.mul_(a / a_po2)
+        a.copy_(a_po2)
+
+
+class QuantDynamicTanh(nn.Module):
+    """hls4ml-exact DynamicTanh: tanh(Quant8(alpha_po2 * x)), no gamma.
+
+    alpha is rounded to a power of 2 (straight-through in log2), so the Mul is a
+    bit shift. The tanh input is quantized to a power-of-2 grid, so a tanh LUT
+    with one entry per code (TableSize = 8 / scale) is exact; the tanh output
+    goes straight into the next QuantLinear's input quantizer."""
+
+    def __init__(self, alpha, act_bits, in_max=0.0):
+        super().__init__()
+        import brevitas.nn as qnn
+        from brevitas.inject.enum import ScalingImplType
+        from brevitas.quant import Int8ActPerTensorFixedPoint
+
+        quant = Int8ActPerTensorFixedPoint
+        if in_max:
+            # Fixed input range [-in_max, in_max) instead of a learned one. in_max = 4 matches the hls4ml tanh
+            # table span: 8-bit tanh(4) already rounds to the top output code, so clipping there costs nothing,
+            # and the resolution is 1/32 where a learned range can drift to 1/4.
+            quant = Int8ActPerTensorFixedPoint.let(scaling_impl_type=ScalingImplType.CONST, min_val=-in_max, max_val=in_max)
+
+        self.alpha = nn.Parameter(alpha.detach().clone())
+        self.act_quant = qnn.QuantIdentity(act_quant=quant, bit_width=act_bits, return_quant_tensor=False)
+
+    def forward(self, x):
+        # log/pow, not log2/exp2: ONNX has no Exp2; FoldConstants folds this to a constant
+        log_a = torch.log(self.alpha) / math.log(2.0)
+        alpha = torch.pow(2.0, log_a + (torch.round(log_a) - log_a).detach())
+        return torch.tanh(self.act_quant(alpha * x))
+
+
+def quant_residual_stream(model, res_bits):
+    """Quantize the fixed-N DeepSets residual stream: the embed output, every phi residual sum (the last one is the
+    pool input) and the pool output, each with a power-of-2 QuantIdentity. Otherwise hls4ml carries these sums at
+    full accumulator width (25-bit per particle, a 37-bit pool accumulator). Adds body.res_quant and replaces the
+    body's fixed-N forward (network.py is left untouched)."""
+    import types
+
+    import brevitas.nn as qnn
+    from brevitas.quant import Int8ActPerTensorFixedPoint
+
+    body = model.body
+    assert body.fixed_n and not body.pid and not body.add_info and not body.conditional, "fixed-N plain body only"
+    body.res_quant = nn.ModuleList(  # embed out, each phi sum, pool out
+        qnn.QuantIdentity(act_quant=Int8ActPerTensorFixedPoint, bit_width=res_bits, return_quant_tensor=False)
+        for _ in range(len(body.phi_blocks) + 2)
+    )
+
+    def forward_fixed_n(self, x, cond=None, pid=None, add_info=None):
+        q = self.res_quant
+        if x.shape[1] > self.fixed_n:
+            x = x[:, : self.fixed_n, :]
+        h = q[0](self.embed(x))
+        for i, (norm, phi) in enumerate(zip(self.phi_norms, self.phi_blocks)):
+            h = q[i + 1](h + phi(norm(h)))
+        z = nn.functional.adaptive_avg_pool1d(h.transpose(1, 2), 1).flatten(1)
+        return q[-1](z)
+
+    body._forward_fixed_n = types.MethodType(forward_fixed_n, body)
+
+
+def build_deepsets(shape):
+    """Float DeepSets classifier from a shape dict (an arch_config, or the same keys from the CLI)."""
+    return DeepSets(
+        input_dim=4, num_classes=2, mode="classifier",
+        num_interaction_layers=shape.get("num_interaction_layers", 0),
+        interaction_k=shape.get("interaction_k", 0),
+        act_layer=ACT_LAYERS[shape["act_layer"]],
+        fixed_n=shape["fixed_n"],
+        **get_deepsets_parameters(shape["size"]),
+    )
+
+
+def read_arch_config(checkpoint_dir, tag):
+    """The arch_config saved with a checkpoint, or None for checkpoints saved before it existed."""
+    path = os.path.join(checkpoint_dir, get_checkpoint_name(tag))
+    return torch.load(path, map_location="cpu", weights_only=False).get("arch_config")
+
+
+def load_qat_model(checkpoint_dir, tag):
+    """Rebuild a QAT checkpoint from its arch_config and load its weights. Returns (model, arch_config)."""
+    cfg = read_arch_config(checkpoint_dir, tag)
+    q = (cfg or {}).get("quant") or {}
+    if not q.get("full_quant"):
+        raise ValueError(f"{tag} is not a full-quant QAT checkpoint (no arch_config with quant.full_quant)")
+    model = build_deepsets(cfg)
+    # Keys missing from older full-quant checkpoints (r1-r4) mean the option was off.
+    wrap_linears_qat(model, q["weight_bits"], tanh_in_max=q.get("tanh_in_max") or 0.0,
+                     res_bits=q.get("res_bits") or 0, relu_uint=bool(q.get("relu_uint")))
+    restore_checkpoint(model, checkpoint_dir, get_checkpoint_name(tag), 0, is_main_node=True)
+    return model, cfg
+
+
+def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True):
     """Replace every nn.Linear in `model` with a Brevitas QuantLinear in
     place, copying over the existing (already-trained) weight/bias so this
     is a warm start, not a random re-init. Submodule names/paths are
@@ -65,10 +230,32 @@ def wrap_linears_qat(model, weight_bits, act_bits):
     everything downstream that walks named_parameters() by path --
     no_weight_decay() matching, get_param_groups()'s "body.embed"/"norm"
     name checks, save_checkpoint's model.module.body.state_dict() -- keeps
-    working unmodified."""
+    working unmodified.
+
+    Biases are quantized too (Int16Bias, on the accumulator grid) and every
+    DynamicTanh becomes a QuantDynamicTanh (gamma dropped -- call
+    fold_dyt_gamma first when warm-starting from a float model). Every op
+    between Quant nodes is then exact in fixed point.
+
+    tanh_in_max: fixed tanh-input range [-x, x); 0 = learned.
+    res_bits: also quantize the residual stream and pool (quant_residual_stream); 0 = off.
+    relu_uint: unsigned input quantizer for a Linear fed directly by a ReLU (MLP.fc2), one more bit of resolution."""
     import brevitas.nn as qnn
     # Power-of-2 scales: in firmware each scale is a bit shift, not a multiplier.
-    from brevitas.quant import Int8ActPerTensorFixedPoint, Int8WeightPerTensorFixedPoint
+    from brevitas.quant import (
+        Int8ActPerTensorFixedPoint,
+        Int8WeightPerTensorFixedPoint,
+        Int16Bias,
+        Uint8ActPerTensorFixedPoint,
+    )
+
+    if res_bits:
+        quant_residual_stream(model, res_bits)
+
+    for module in list(model.modules()):
+        for child_name, child in module.named_children():
+            if isinstance(child, DynamicTanh):
+                setattr(module, child_name, QuantDynamicTanh(child.alpha, bits, tanh_in_max))
 
     targets = []
     for module in model.modules():
@@ -77,14 +264,18 @@ def wrap_linears_qat(model, weight_bits, act_bits):
                 targets.append((module, child_name, child))
 
     for module, child_name, child in targets:
+        # MLP: fc1 -> act -> norm -> fc2; fc2 sees the ReLU output only when norm is Identity (not the embed MLP)
+        after_relu = (relu_uint and child_name == "fc2" and isinstance(getattr(module, "act", None), nn.ReLU)
+                      and isinstance(getattr(module, "norm", None), nn.Identity))
         qlin = qnn.QuantLinear(
             child.in_features,
             child.out_features,
             bias=child.bias is not None,
             weight_quant=Int8WeightPerTensorFixedPoint,
-            weight_bit_width=weight_bits,
-            input_quant=Int8ActPerTensorFixedPoint,
-            input_bit_width=act_bits,
+            weight_bit_width=bits,
+            input_quant=Uint8ActPerTensorFixedPoint if after_relu else Int8ActPerTensorFixedPoint,
+            input_bit_width=bits,
+            bias_quant=Int16Bias,
             return_quant_tensor=False,
         )
         qlin.weight.data.copy_(child.weight.data)
@@ -97,9 +288,10 @@ def wrap_linears_qat(model, weight_bits, act_bits):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", required=True, help="base float checkpoint tag to warm-start from")
-    ap.add_argument("--size", required=True, help="e.g. small, distillnet, tiny, micro, nano")
-    ap.add_argument("--save-tag", required=True, help="new tag for the QAT checkpoint")
+    ap.add_argument("--tag", required=True, help="float checkpoint to start from: <init-dir>/best_model_<tag>.pt")
+    ap.add_argument("--save-tag", required=True, help="tag of the QAT checkpoint written to <output-dir>")
+    ap.add_argument("--init-dir", default=CHECKPOINT_DIR, help="dir holding the float --tag checkpoint")
+    ap.add_argument("--output-dir", default=CHECKPOINT_DIR, help="dir the QAT checkpoint is written to")
     ap.add_argument("--bits", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--warmup-epoch", type=float, default=1.0)
@@ -113,49 +305,50 @@ def main():
     ap.add_argument("--distill-alpha", type=float, default=0.5)
     ap.add_argument("--distill-beta", type=float, default=0.5)
     ap.add_argument("--distill-t", type=float, default=4.0)
-    ap.add_argument("--num-interaction-layers", type=int, default=0,
-                    help="must match the float checkpoint's message-passing depth")
-    ap.add_argument("--interaction-k", type=int, default=0,
-                    help="must match the float checkpoint's leading-pT constituent cap")
-    ap.add_argument("--act-layer", default="gelu", choices=sorted(ACT_LAYERS),
-                    help="must match the float checkpoint's activation")
+    # Only for float checkpoints saved before arch_config existed; otherwise the shape comes from the checkpoint.
+    ap.add_argument("--size", help="e.g. distillnet, d12p2r1m1 (old float checkpoints only)")
+    ap.add_argument("--act-layer", default="relu", choices=sorted(ACT_LAYERS),
+                    help="float checkpoint's activation (old float checkpoints only)")
     ap.add_argument("--deepsets-fixed-n", type=int, default=0,
-                    help="must match the float checkpoint's fixed-N/no-mask body (0 = masked-mean)")
+                    help="float checkpoint's fixed-N slot count (old float checkpoints only)")
+    ap.add_argument("--tanh-in-max", type=float, default=4.0,
+                    help="fixed tanh-input range [-x, x) (4 = hls4ml table span); 0 = learned")
+    ap.add_argument("--res-bits", type=int, default=10,
+                    help="quantize the residual stream and pool output to this many bits (0 = off)")
+    ap.add_argument("--relu-uint", action=argparse.BooleanOptionalAction, default=True,
+                    help="unsigned input quantizer for Linears fed by a ReLU (phi/rho fc2)")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
 
-    ds_params = get_deepsets_parameters(args.size)
-    model = DeepSets(
-        input_dim=4, num_classes=2, mode="classifier",
-        num_interaction_layers=args.num_interaction_layers,
-        interaction_k=args.interaction_k,
-        act_layer=ACT_LAYERS[args.act_layer],
-        fixed_n=args.deepsets_fixed_n,
-        **ds_params,
-    )
-    restore_checkpoint(
-        model, CHECKPOINT_DIR, get_checkpoint_name(args.tag), local_rank, is_main_node=is_master_node()
-    )
+    shape = read_arch_config(args.init_dir, args.tag)
+    if shape is None:
+        if args.size is None:
+            ap.error(f"{args.tag} has no arch_config: pass --size, --act-layer and --deepsets-fixed-n")
+        shape = {"size": args.size, "act_layer": args.act_layer, "fixed_n": args.deepsets_fixed_n}
+    model = build_deepsets(shape)
+    restore_checkpoint(model, args.init_dir, get_checkpoint_name(args.tag), local_rank, is_main_node=is_master_node())
     n_params = sum(p.numel() for p in model.parameters())
     if is_master_node():
-        print(f"Warm-started from {args.tag} ({args.size}): {n_params:,} params")
+        print(f"Warm-started from {args.tag} (size={shape['size']} act={shape['act_layer']} "
+              f"fixed_n={shape['fixed_n']}): {n_params:,} params")
 
-    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits)
+    fold_dyt_gamma(model)
+    wrap_linears_qat(model, args.bits, tanh_in_max=args.tanh_in_max, res_bits=args.res_bits, relu_uint=args.relu_uint)
     # Saved into the checkpoint so the exact quantized network can be rebuilt for
     # FPGA conversion. Quantizer types and bit widths are read back from the
     # wrapped layers, so the record always matches what was trained.
     qlin = next(m for m in model.modules() if type(m).__name__ == "QuantLinear")
     model.arch_config = {
         "arch": "deep-sets",
-        "size": args.size,
-        "dims": ds_params,
+        "size": shape["size"],
+        "dims": get_deepsets_parameters(shape["size"]),
         "input_dim": 4,
         "num_classes": 2,
-        "act_layer": args.act_layer,
-        "fixed_n": args.deepsets_fixed_n,  # 0 = masked mean over valid particles
-        "num_interaction_layers": args.num_interaction_layers,
-        "interaction_k": args.interaction_k,
+        "act_layer": shape["act_layer"],
+        "fixed_n": shape["fixed_n"],
+        "num_interaction_layers": shape.get("num_interaction_layers", 0),
+        "interaction_k": shape.get("interaction_k", 0),
         "energy_weighted_pool": False,
         "pid": False,
         "add_info": False,
@@ -166,6 +359,10 @@ def main():
             "act_quant": qlin.input_quant.quant_injector.__name__,
             "weight_bits": int(qlin.weight_quant.bit_width()),
             "act_bits": int(qlin.input_quant.bit_width()),
+            "full_quant": True,  # Int16Bias biases + QuantDynamicTanh (gamma folded, po2 alpha)
+            "tanh_in_max": args.tanh_in_max,  # 0 = learned tanh-input range
+            "res_bits": args.res_bits,  # residual stream + pool QuantIdentity bits (0 = off)
+            "relu_uint": args.relu_uint,  # unsigned input quant after ReLU
         },
     }
     if is_master_node():
@@ -212,7 +409,7 @@ def main():
         mode="classifier",
         num_epochs=args.epochs,
         device=device,
-        output_dir=CHECKPOINT_DIR,
+        output_dir=args.output_dir,
         save_tag=args.save_tag,
         iterations_per_epoch=train_steps,
         ema_model=None,

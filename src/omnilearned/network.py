@@ -781,7 +781,9 @@ class DeepSetsBody(nn.Module):
         for norm, phi in zip(self.phi_norms, self.phi_blocks):
             h = h + phi(norm(h))  # pre-norm residual, no mask
 
-        z = h.mean(dim=1)  # plain mean over the fixed N slots
+        # plain mean over the fixed N slots, written as a 1-D adaptive pool so
+        # ONNX export emits GlobalAveragePool (hls4ml-supported), not ReduceMean
+        z = nn.functional.adaptive_avg_pool1d(h.transpose(1, 2), 1).flatten(1)
 
         if cond is not None and self.conditional:
             z = z + self.cond_embed(cond)

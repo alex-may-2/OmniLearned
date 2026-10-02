@@ -1,8 +1,7 @@
-"""Export a QAT-trained DeepSets(+GNN) checkpoint to QONNX.
+"""Export a full-quant QAT DeepSets checkpoint (qat_deepsets.py) to QONNX.
 
-Rebuilds the model, wraps its nn.Linear layers with Brevitas QuantLinear at
-the SAME bit width used for QAT (so the checkpoint's quantizer buffers load),
-restores the checkpoint, then serialises the graph with
+Rebuilds the model from the checkpoint's arch_config (shape and quantizer
+settings), restores the weights, then serialises the graph with
 ``brevitas.export.export_qonnx``. The exported model is run through the QONNX
 ``cleanup`` + ``InferShapes`` passes and, if a real test batch and
 onnxruntime are available, checked for numerical parity against PyTorch.
@@ -17,9 +16,7 @@ Must run with the omnilearned-fpga/env python (has Brevitas / QONNX).
 Usage:
     /global/homes/t/twamorka/omnilearned-fpga/env/bin/python \
         tools/quantize/qat_deepsets_export_qonnx.py \
-        --tag qat_top_deepsets_distillnet_gnn_a05_T4_8bit \
-        --size distillnet --bits 8 \
-        --num-interaction-layers 1 --interaction-k 64
+        --tag qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant
 """
 
 import argparse
@@ -29,13 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from omnilearned.network import DeepSets, ACT_LAYERS
-from omnilearned.utils import (
-    get_checkpoint_name,
-    get_deepsets_parameters,
-    restore_checkpoint,
-)
-from qat_deepsets import wrap_linears_qat
+from qat_deepsets import load_qat_model
 
 CHECKPOINT_DIR = "/pscratch/sd/t/twamorka/omnilearned/checkpoints/"
 DATA_PATH = "/global/cfs/cdirs/m4567/www/"
@@ -77,44 +68,21 @@ def real_batch(size, num_workers):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True, help="QAT checkpoint save-tag")
-    ap.add_argument("--size", required=True)
-    ap.add_argument("--bits", type=int, required=True,
-                    help="must match the bit width used in QAT training")
-    ap.add_argument("--num-interaction-layers", type=int, default=0)
-    ap.add_argument("--interaction-k", type=int, default=0)
-    ap.add_argument("--act-layer", default="gelu", choices=sorted(ACT_LAYERS),
-                    help="must match the QAT checkpoint's activation")
-    ap.add_argument("--deepsets-fixed-n", type=int, default=0,
-                    help="must match the QAT checkpoint's fixed-N/no-mask body (0 = masked-mean)")
     ap.add_argument("--batch", type=int, default=64,
                     help="batch size for the parity check / export dummy")
     ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--checkpoint-dir", default=CHECKPOINT_DIR, help="dir holding the QAT --tag checkpoint")
     ap.add_argument("--out-dir", default=OUT_DIR)
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     torch.manual_seed(0)
 
-    ds_params = get_deepsets_parameters(args.size)
-    model = DeepSets(
-        input_dim=4, num_classes=2, mode="classifier",
-        num_interaction_layers=args.num_interaction_layers,
-        interaction_k=args.interaction_k,
-        act_layer=ACT_LAYERS[args.act_layer],
-        fixed_n=args.deepsets_fixed_n,
-        **ds_params,
-    )
-
-    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits)
-    n_qlin = sum(1 for m in model.modules() if type(m).__name__ == "QuantLinear")
-    print(f"Wrapped {n_qlin} nn.Linear layers as QuantLinear ({args.bits}-bit)")
-
-    restore_checkpoint(
-        model, CHECKPOINT_DIR, get_checkpoint_name(args.tag), 0, is_main_node=True
-    )
+    model, cfg = load_qat_model(args.checkpoint_dir, args.tag)
     model.cpu().eval()
+    fixed_n = cfg["fixed_n"]
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Loaded {args.tag} ({args.size}, {args.bits}-bit QAT): {n_params:,} params")
+    print(f"Loaded {args.tag} ({cfg['size']}, fixed_n={fixed_n}, quant={cfg['quant']}): {n_params:,} params")
 
     wrapper = LogitWrapper(model).cpu().eval()
 
@@ -122,11 +90,11 @@ def main():
     if X_np is None:
         X_np = np.random.randn(args.batch, N_SLOTS, 4).astype(np.float32)
         X_np[:, N_SLOTS // 3:, 2] = 0.0  # zero log-pT tail -> masked out
-    if args.deepsets_fixed_n:
+    if fixed_n:
         # Feed exactly the fixed-N leading-pT slots so the exported graph
         # carries no in-body Slice (the body's `x.shape[1] > n` guard is then
         # False). Host-side truncation is part of this model's contract.
-        X_np = np.ascontiguousarray(X_np[:, : args.deepsets_fixed_n, :])
+        X_np = np.ascontiguousarray(X_np[:, :fixed_n, :])
     dummy = torch.from_numpy(X_np).float()
     print(f"Export input shape: {tuple(dummy.shape)}")
 
@@ -136,7 +104,9 @@ def main():
     raw_path = os.path.join(args.out_dir, f"{args.tag}.onnx")
     from brevitas.export import export_qonnx
 
-    export_qonnx(wrapper, args=dummy, export_path=raw_path)
+    # dynamo=False: the TorchScript exporter keeps the pool as GlobalAveragePool;
+    # the dynamo one (torch>=2.9 default) decomposes it back to ReduceMean.
+    export_qonnx(wrapper, args=dummy, export_path=raw_path, dynamo=False)
     print(f"Wrote raw QONNX -> {raw_path}")
 
     from qonnx.core.modelwrapper import ModelWrapper

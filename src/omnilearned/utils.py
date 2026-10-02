@@ -1,5 +1,6 @@
 from sklearn import metrics
 import os
+import re
 import numpy as np
 import torch
 import torch.nn as nn
@@ -97,6 +98,10 @@ def get_deepsets_parameters(model_size):
         return {"base_dim": 256, "num_phi_layers": 4, "num_rho_layers": 3}
     elif model_size == "large":
         return {"base_dim": 512, "num_phi_layers": 5, "num_rho_layers": 4}
+    elif m := re.fullmatch(r"d(\d+)p(\d+)r(\d+)m(\d+)", model_size):  # e.g. d8p2r1m1 = mlp_ratio 1
+        return {"base_dim": int(m[1]), "num_phi_layers": int(m[2]), "num_rho_layers": int(m[3]), "mlp_ratio": int(m[4])}
+    elif m := re.fullmatch(r"d(\d+)p(\d+)r(\d+)", model_size):  # e.g. d8p2r1
+        return {"base_dim": int(m[1]), "num_phi_layers": int(m[2]), "num_rho_layers": int(m[3])}
     else:
         raise ValueError(f"Invalid model size: {model_size}")
 
