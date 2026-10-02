@@ -145,7 +145,8 @@ Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 | d8p1r1 n32, 50 ep + QAT | 0.9631 | 0.9532 | 37.4 |
 
 - Training: float KD 50 epochs, then full-quant QAT 15 epochs (§7). QAT AUC comes from the exported QONNX graph via
-  `convert.py`, not from `qat_deepsets_eval.py` (which rebuilds full-quant models wrong).
+  `convert.py`. Since 2026-10-01 `qat_deepsets_eval.py` rebuilds full-quant checkpoints from their `arch_config` and
+  matches it: H1g gives acc 0.9106 / AUC 0.9697 / 1/eB@0.5 91.5 on all 404k jets, the same as HLS C-sim.
 - 9-epoch single-GPU screens ranked d8p1r1 n32 first; full training put it last. Use screens only as smoke tests.
 - 9984 jets give AUC ±0.002 and 1/eB@0.5 ±20%. Rank with `csim_forward.py` on all 404k jets (README).
 
@@ -170,8 +171,8 @@ SIZE=d12p2r1m1 N=16 setsid nohup salloc -C gpu -q interactive -t 240 --nodes 1 -
 
 `ps_final.sbatch` runs three stages:
 1. float KD: top_deepsets_distillnet_fpga recipe, `--act-layer relu --deepsets-fixed-n N`, 50 epochs on 1 node;
-2. `qat_deepsets.py --full-quant --tanh-in-max 4 --res-bits 10 --relu-uint`, 15 epochs at 5e-5;
-3. `qat_deepsets_export_qonnx.py`.
+2. `qat_deepsets.py` (always full-quant; its defaults are `--tanh-in-max 4 --res-bits 10 --relu-uint`), 15 epochs at 5e-5;
+3. `qat_deepsets_export_qonnx.py --tag <qat_tag>` (shape and quant settings come from the checkpoint's `arch_config`).
 
 HLS (rdsrv, `synthesis/`):
 

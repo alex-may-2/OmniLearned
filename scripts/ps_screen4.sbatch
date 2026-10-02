@@ -18,7 +18,7 @@
 set -uo pipefail
 : "${SCREENS:?SCREENS must be set via --export}"
 EPOCH=${EPOCH:-9}
-REPO=/pscratch/sd/a/alexmay/OmniLearned
+REPO=/global/homes/a/alexmay/working/OmniLearned
 BASE=/pscratch/sd/a/alexmay/omnilearned
 DATA=/global/cfs/cdirs/m4567/www/
 TEACHER=/pscratch/sd/t/twamorka/omnilearned/teacher_logits/companion_fine_tune_top_l

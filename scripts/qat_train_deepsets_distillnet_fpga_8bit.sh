@@ -1,12 +1,11 @@
 #!/bin/bash
-# 8-bit QAT fine-tune of the hls4ml-friendly plain distillnet student
+# 8-bit full-quant QAT fine-tune of the hls4ml-friendly plain distillnet student
 # (fixed-N=64, ReLU, no mask). Warm-started from the float KD checkpoint
-# distill_top_deepsets_distillnet_fpga_a05_T4; Linear layers -> Brevitas
-# QuantLinear (8-bit weight + activation); same distillation recipe
-# (alpha=0.5/beta=0.5/T=4 vs fine_tune_top_l) the float run used. One-variable
-# change from qat_train_deepsets_distillnet_8bit.sh: the --act-layer /
-# --deepsets-fixed-n flags so qat_deepsets.py rebuilds the fpga body before
-# restoring the checkpoint.
+# distill_top_deepsets_distillnet_fpga_a05_T4, with the same distillation recipe
+# (alpha=0.5/beta=0.5/T=4 vs fine_tune_top_l) the float run used. qat_deepsets.py
+# is always full-quant (see its docstring); its defaults are the recipe of the
+# r7 reference graph. That float checkpoint predates arch_config, so --size /
+# --act-layer / --deepsets-fixed-n are passed to rebuild its shape.
 #
 # CRITICAL: uses omnilearned-fpga/env (has Brevitas), NOT omnilearned-clean/env.
 #
@@ -29,7 +28,7 @@ cmd="/global/homes/t/twamorka/omnilearned-fpga/env/bin/python tools/quantize/qat
   --tag distill_top_deepsets_distillnet_fpga_a05_T4 \
   --size distillnet --bits 8 \
   --act-layer relu --deepsets-fixed-n 64 \
-  --save-tag qat_top_deepsets_distillnet_fpga_a05_T4_8bit \
+  --save-tag qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant \
   --epochs 15 --warmup-epoch 1 --lr 5e-5 --wd 0.5 \
   --batch 128 --iterations 1000 --num-workers 4 \
   --teacher-dir /pscratch/sd/t/twamorka/omnilearned/teacher_logits/companion_fine_tune_top_l \

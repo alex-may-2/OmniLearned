@@ -179,8 +179,12 @@ Config gotchas:
 
 Training: `tools/quantize/qat_deepsets.py --full-quant --tanh-in-max 4 [--res-bits N --relu-uint]`,
 warm-started from the float `distill_top_deepsets_distillnet_fpga_a05_T4` with the same KD recipe as the
-first QAT. Export: `qat_deepsets_export_qonnx.py` with the same quantization flags (the checkpoint keys
-depend on them). `--resume-qat` continues from an existing full-quant QAT checkpoint.
+first QAT. r5-r8 continued from r4 with `--resume-qat` at lr 2e-5.
+
+Since 2026-10-01 `qat_deepsets.py` is always full-quant: `--full-quant` and `--resume-qat` are gone, and the
+defaults are `--tanh-in-max 4 --res-bits 10 --relu-uint`. QAT reads the model shape from the float checkpoint's
+`arch_config`. Export (`qat_deepsets_export_qonnx.py --tag <qat_tag>`) and `qat_deepsets_eval.py` rebuild the
+model from the QAT checkpoint's `arch_config`.
 
 Model changes relative to the first QAT graph:
 

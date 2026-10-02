@@ -223,4 +223,4 @@ symlink to it. This keeps both reference styles working:
   (see `../docs/EXPERIMENTS_deepsets_kd.md`)
 - `run_all_chunks.sh` / `submit_datasets.sh` — chunked teacher-logit generation
 - `train_omnifold_pythia_herwig.sh` / `distill_loop_omnifold.sh` — OmniFold unfolding
-- `qat_train_deepsets_distillnet_8bit.sh` — QAT for the FPGA student
+- `qat_train_deepsets_distillnet_fpga_8bit.sh` — full-quant QAT for the FPGA student
