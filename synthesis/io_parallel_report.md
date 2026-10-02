@@ -1,139 +1,192 @@
-# io_parallel feasibility for the DeepSets top tagger (2026-09-28/29, rdsrv409)
+# Single-SLR io_parallel design for the full-quant DeepSets top tagger (rdsrv409 + NERSC)
 
-Question: can the DeepSets student run fully parallel in hls4ml for an L1 trigger, and how many particles fit?
+Run log, one row per run (history, including abandoned multi-copy builds): `synthesis/parallel_search_log.md`.
 
-All numbers are Vitis HLS 2024.1 csynth estimates:
-- part `xcvu13p-flga2577-2-e`, 5 ns clock, `Latency` strategy, RF 1;
-- no Vivado place and route;
-- device 1.73M LUT, one SLR 432k LUT.
+**Requirement.** L1T needs one jet every 25 ns from one copy of the tagger on one SLR:
+- II ns = II cycles × clock period ≤ 25 ns;
+- one SLR of `xcvu13p-flga2577-2-e`: 432k LUT (target < 80%), 864k FF, 3072 DSP, 1344 BRAM_18K;
+- csynth estimated clock ≤ target clock.
 
-Mini-model points use random weights from `mini_parallel.py`, and every one is bit-exact in C-sim vs qonnx.
+II, the one-SLR fit and the clock are hard limits. AUC is soft (reference 0.9644 = r7 − 0.01 on the 9984-jet subset).
+
+**Caveat.** All hardware numbers are Vitis HLS 2024.1 csynth estimates. There is no Vivado place and route. Clocks of
+320 MHz and above are **csynth-only, not P&R-confirmed**.
 
 ## Summary
 
-- **The real 64-particle graph does not synthesize in io_parallel.** Vitis was still unrolling at the 1 h cap. With
-  io_stream it fits easily: latency 0.6 µs, II 68 cycles (0.34 µs), 19% LUT.
-- **The full-quant model removes the tanh blocker, but not the size problem.**
-  - Tanh becomes a 256 x 8-bit exact table (~28 LUT per lookup, no BRAM), and the po2 alpha becomes a shift.
-  - On the same topology it still costs 13-19% more LUT than a ReLU-only mini, because it has more layers.
-- **The particle count is limited by the elementwise layers and FIFOs, not by the multiplies.**
-  - PF (ParallelizationFactor) only narrows the per-particle convs. ReLU, alpha+Quant, tanh, residual Add and
-    the dataflow FIFOs are fully parallel over all n particles.
-  - They cost ~1.2k LUT per particle per base channel.
-- **Best real-topology point found:** dim 16, n 32, PF 2.
-  - 57% LUT, II 80 ns, latency 0.53-0.55 µs.
-  - The trained size (dim 32) only fits at n 16: 88% LUT, and it misses 5 ns. n 64 at dim 32 would need ~2.5M LUT.
-- **Fully parallel (PF = n, II ≤ 25 ns) is out of reach on this machine.** Vitis needed more than 58 GB even for a
-  10.5k-MAC mini.
-- **For L1T, io_stream is the practical path.** The II needed is the TMUX period (150 ns at TMUX 6), not 25 ns.
-  io_stream at 250 MHz with 2 copies fed round-robin should give ~135 ns effective II at ~0.5 µs latency
-  (see below).
+| design (trained, full-quant) | build | II cycles / ns | LUT / FF / DSP % SLR | clock est. | latency | AUC 9984 jets | AUC / 1/eB@0.5, all 404k jets |
+|---|---|---|---|---|---|---|---|
+| **H1g: d12p2r1m1, n 16** (mlp_ratio 1) | PF 2, 360 MHz | 8 / 22.2 | 66 / 21 / 0 | 2.03 ns | 100 cyc = 278 ns | **0.9685** | **0.9697 / 91.5** |
+| H1r: d8p2r1, n 16 | PF 2, 360 MHz | 8 / 22.2 | 59 / 18 / 0 | 1.96 ns | 275 ns | 0.9653 | 0.9666 / 78.1 |
+| H1f: d8p2r1, n 16 + `--dsp-mult` | PF 2, 360 MHz | 8 / 22.2 | 56 / 18 / 10 | 1.96 ns | | 0.9653 | same as H1r |
+| d8p2r1, n 16 | PF 4, 200 MHz | 4 / 20.0 | 67 / 15 / 0 | 3.65 ns | 300 ns | 0.9653 | |
+| d8p2r1, n 16 | PF 2, 320 MHz | 8 / 25.0 | 57 / 17 / 0 | 2.28 ns | | 0.9653 | |
 
-## 1. Real graph
+- **H1g is the current design.** It meets all three limits, and it is bit-exact (max |Δ logit| = 0) between QONNX and
+  HLS C-sim. Its float model scores 0.9731 (all 404k jets).
+- **H1r / H1f are the smaller fallback.** `--dsp-mult` moves 328 multiplies to DSPs for −5% LUT, with the same II,
+  timing and AUC.
+- **What made io_parallel work:**
+  1. `--mult-limit-fix` (II = n/PF);
+  2. `--clone-fanout` (timing);
+  3. a fast clock: at 360 MHz, PF 2 (8 cycles) needs half the parallel multipliers of PF 4 at 200 MHz (4 cycles),
+     so it uses 59% vs 67% LUT.
+- **Model:** fewer particles (16) and narrower layers. mlp_ratio 1 (m1) frees LUT that buys width (d8 → d12).
+  Dropping the residual phi block (p1) frees more LUT, but costs ~0.01 AUC after full training.
+- Full-test-set comparison with r7 and the float models: `README.md`, "Full test set comparison".
+
+## 1. Why the original model does not fit (2026-09-28/29)
+
+The r7-size model (d32p2r1, 64 particles, ~410k MACs per jet) cannot run in io_parallel on one SLR.
 
 | graph | io | result |
 |---|---|---|
-| first QAT (`_8bit`, float DynamicTanh) | io_stream, Resource | latency 120 cyc = 0.6 µs, II 68 cyc, LUT 340k (19%), DSP 1334, BRAM 628, clock est. 3.65 ns |
+| first QAT (`_8bit`, float DynamicTanh) | io_stream, Resource, 5 ns | latency 0.6 µs, II 68 cyc = 340 ns, LUT 340k (78% SLR), DSP 1334, BRAM 628 |
 | first QAT | io_parallel, Latency, PF 16 | C-sim fine; csynth killed at 1 h in unroll (110k instructions) |
-| full-quant (r4) | io_parallel PF 16 | C-sim bit-exact (run on NERSC); not synthesized |
+| r7 (full-quant) | io_stream, Resource | II ~n cycles; bit-exact; kept as the reference project |
 
-Why the first graph fails in io_parallel:
-- `tanh` has a function-level `PIPELINE` pragma, which unrolls the 4096-entry table init.
-- 4096 parallel lookups into a 4096 x 18-bit table do not fit (~7M LUT).
-- The model is ~410k MACs per jet.
+- **Tanh blocker (first QAT graph):** hls4ml's io_parallel `tanh` has a function-level `PIPELINE`, which unrolls the
+  4096-entry table init, and 4096 parallel lookups into a 4096 x 18-bit table need ~7M LUT. The full-quant recipe
+  fixes this: 256 x 8-bit exact tables (~28 LUT per lookup, no BRAM) and a power-of-2 alpha (a shift).
+- **Size blocker:** in io_parallel, the elementwise layers (ReLU, alpha + Quant, tanh, residual Add) and the
+  DATAFLOW FIFOs are fully parallel over all n particles, whatever the PF. PF only narrows the per-particle convs.
+
+Random-weight mini scan (`mini_parallel.py`, 5 ns, every point bit-exact in C-sim):
+
+| model | n | PF | II | LUT | note |
+|---|---|---|---|---|---|
+| ReLU-only, phi 32-16 / rho 16 | 16 | 8 | 40 ns | 366k (84% SLR) | |
+| full-quant, phi 32-16 / rho 16 | 16 | 8 | 40 ns | 434k | +19% LUT, +7-8 cycles |
+| distillnet d32 | 16 | 2 | 40 ns | 1.53M (354% SLR) | misses 5 ns; 33 GB |
+| distillnet d16 | 32 | 2 | 80 ns | 996k (231% SLR) | 30 GB |
+| PF = n (fully parallel) | 16 | 16 | — | — | Vitis OOM (> 58 GB) |
+
+Cost rules (io_parallel):
+- **elementwise + FIFO** ≈ 1.2k LUT × n × dim, independent of PF (relaxing II does not shrink it);
+- **convs** ≈ 50-70 LUT per parallel multiply, DSP = 0 unless `--dsp-mult` (all 8-bit products go into LUTs);
+- **II** = n / PF cycles once `--mult-limit-fix` is on;
+- **Vitis memory** ≈ 30 GB at n × dim = 512, more than 55 GB at 1024. Run those synths alone.
+
+So one SLR needs roughly n × dim ≤ ~200: a smaller student.
 
 **PF gotcha:** set `ParallelizationFactor` on `MatMul_<i>`. hls4ml's `MatmulConstToDense` overwrites the
 `Dense_MatMul_<i>` config with it. Check `firmware/parameters.h`: `n_partitions = n / PF`.
 
-## 2. Mini scan
+## 2. r7 mirror
 
-`mini_parallel.py` modes:
-- **default:** ReLU only, no biases, no tanh. phi = per-particle widths, rho = post-pool widths.
-- **`--full-quant`:** same widths, with the full-quant elements: Int16 biases, and each hidden
-  `ReLU -> Mul(po2 alpha) -> Quant(8b, 1/32) -> Tanh -> Quant(8b, 1/128)`.
-- **`--distillnet`:** the real student topology with full-quant elements:
-  - embed `4 -> 2d -> d` with DyT;
-  - residual phi block(s);
-  - mean pool;
-  - residual rho block(s);
-  - `-> 2` logits.
+`mini_parallel.py --distillnet` builds the r7 graph element for element:
+- input Quant 8b 1/32;
+- embed alpha 1;
+- 10-bit residual stream (embed out 1/128, phi out 1/64);
+- 10-bit pool output 1/512;
+- unsigned 8-bit block-ReLU Quants (phi 1/64, rho 1/128);
+- 8-bit 1/128 before the output Linear.
 
-### ReLU-only vs full-quant, same topology (n 16, PF 8)
+It is C-sim bit-exact in io_parallel and io_stream.
 
-| phi / rho | variant | latency | II | LUT | FF | csynth time, peak RAM |
-|---|---|---|---|---|---|---|
-| 32-16 / 16 | ReLU only | 145-155 ns | 40 ns | 366k (21%, 84% SLR) | 124k | 4 min, 4 GB |
-| 32-16 / 16 | full-quant | 185-195 ns | 40 ns | 434k (25%) | 196k | 6 min, 7 GB |
-| 64-32 / 32 | ReLU only | 145-155 ns | 30 ns | 1.04M (60%) | 296k | 26 min, 14 GB |
-| 64-32 / 32 | full-quant | 180-190 ns | 30 ns | 1.17M (67%) | 444k | 36 min, 23 GB |
+Two conversion details had to change:
+- **Embed Mul by 1.** In the mini graph, hls4ml dropped the tanh-input Quant after this Mul (max |Δ logit| 0.05).
+  The mini graph therefore omits the Mul, and ReLU + Quant fuse as they do in r7.
+- **Pool mean for non-power-of-2 n.** hls4ml computes `sum /= n`, truncated in the accumulator type. The exact
+  mean is never closer than 1/(n·2^10) to a rounding tie of the 10-bit pool Quant. Six more fractional
+  accumulator bits keep it bit-exact (checked at n = 12, 24, 28). `convert.py` does the same.
 
-Other ReLU-only points:
-- n 16, phi 64-32, PF 4: 165-175 ns, II 40 ns, 743k LUT.
-- n 32, phi 64-32, PF 8: 205-215 ns, II 60 ns, 1.39M LUT, 39 GB.
+## 3. What sets II, and the fixes (d8 n16, random weights)
 
-Fully parallel (PF 16) runs failed:
-- phi 64-32: clang OOM after unroll (2.4M instructions).
-- phi 32-16: 58 GB, OOM-killed.
+| run | change | II cycles | clock est. | LUT % SLR | note |
+|---|---|---|---|---|---|
+| L0 | PF 2, 5 ns | 8 | 5.79 miss | 59 | II = n/PF |
+| L1 | PF 4 | 8 | 5.79 miss | 64 | floor: 2 cycles per partition |
+| L2 | PF 4 + `--mult-limit-fix` | 4 | 5.79 miss | 68 | II = n/PF again |
+| L2c | L2 + fan-out clones | 4 | 3.65 | 69 | passes at 200 MHz |
+| L6b | PF 2, 2.78 ns + fixes | 8 (22.2 ns) | 2.01 | 60 | passes at 360 MHz |
+| L6c | PF 2, 3.125 ns + fixes | 8 (25.0 ns) | 2.28 | 58 | passes at 320 MHz |
+| L4 | L2b (PF 4, mlf) + `--dsp-mult` | 4 | (pre-clone) | 60 (−11%) | 804 multiplies on DSP |
+| L3 / L5 | PF = n, pipeline style | 5 / 2 | 3.5 / 3.6 | 102 / 98 | no FIFOs, but fully parallel |
+| L7a/L7b | pipeline style, top II 5 / 8 | — | — | — | stalled in scheduling > 30 min; stopped |
 
-LUT by layer kind, phi 64-32:
+- **II floor.** In `nnet_conv1d_latency.h`, the partition loop runs at II = RF under
+  `ALLOCATION mul limit = n_chan·n_filt/RF`. That limit counts one particle, but each iteration does PF particles.
+  `--mult-limit-fix` scales the limit by `n_pixels`. II then equals n_partitions × RF.
+- **Clock miss.** Each residual skip array, and the pool output, has two readers in the DATAFLOW top (the DyT
+  branch and the residual Add). Vitis then chains producer and consumers in one cycle: pool 3.0 ns plus alpha+Quant
+  2.8 ns.
+  - Giving each reader its own copy through a clone process removes the chain: 5.84 → 3.65 ns at 5 ns, and 2.01 ns
+    at 2.78 ns.
+  - `--clone-fanout` in `convert.py`; always on in `mini_parallel.py` io_parallel.
+  - Registering the pool output (`LATENCY min=1`) did not help.
 
-| layer | ReLU only | full-quant |
-|---|---|---|
-| per-particle convs | 691k | 673k |
-| ReLU (ReLU only: fused with its 8-bit Quant) | 172k | 75k |
-| alpha shift + tanh-input Quant | — | 108k |
-| tanh (256-entry tables) | — | 43k |
-| dataflow FIFOs | 71k | 139k |
-| rho dense | 44k | 44k |
+## 4. Model knobs (random weights, d8 n16, PF 2, 360 MHz)
 
-Full-quant does not make the multiplies more expensive. The extra cost comes from the steps:
-- one elementwise layer becomes three (ReLU, alpha + Quant, tanh);
-- each extra layer adds a dataflow stage with its own FIFO, which doubles the FIFO LUTs and adds 7-8 cycles;
-- a Quant costs its rounding and saturation, a few tens of LUT per element, for every element in parallel.
+| run | knob | LUT | vs L6b (263k) | keep? |
+|---|---|---|---|---|
+| M1 | p1: no residual phi block | 115k | −56% | costs ~0.01 AUC after full training (§5) |
+| M3 | mlp_ratio 1 | 173k | −34% | **yes**: size suffix `d<dim>p<p>r<r>m1` (nersc `utils.py`) |
+| M2 | r0: no rho block | 244k | −7% | no |
+| M4 | no embed DyT | 251k | −5% | no |
 
-### Real topology (`--distillnet`)
+Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 
-| dim | n | PF | MACs/jet | latency | II | LUT | clock est. | csynth time, peak RAM |
-|---|---|---|---|---|---|---|---|---|
-| 32 | 16 | 2 | 107k | 0.44-0.46 µs | 40 ns | 1.53M (88%) | **5.75 ns, misses 5 ns** | 30 min, 33 GB |
-| 32 | 32 | 1 | 209k | — | — | — | — | killed at 55 GB |
-| 16 | 32 | 2 | 54k | 0.53-0.55 µs | 80 ns | 996k (57%) | 4.20 ns | 24 min, 30 GB |
-
-Both finished points have n x dim = 512, and both spend about 600k LUT outside the convs and the rho dense. That gives the scaling rule:
-- **elementwise + FIFO** ≈ 1.2k LUT x n x dim, independent of PF;
-- **convs** ≈ 50-70 LUT per parallel multiply, DSP = 0 (all 8-bit products go into LUTs);
-- **II** ≈ n / PF cycles;
-- **Vitis memory** ≈ 30 GB at n x dim = 512, and more than 55 GB at 1024. Run these synths alone.
-
-**Clock:** at dim 32, the exact-mean pool (`fixed<31,12>`) and the next alpha + Quant are chained in one cycle
-(2.3 + 3.5 ns). Narrow the pool result type, or register the pool output, to fix it.
-
-## 3. io_stream for L1T (estimates, not synthesized)
-
-io_stream reads one particle per clock, so its II is about n cycles.
-
-| option | II | latency | LUT |
+| run | shape | PF | LUT % SLR |
 |---|---|---|---|
-| now: n 64, 200 MHz | 340 ns | 600 ns | 19% |
-| n 64, 250 MHz (clock est. 3.65 ns) | ~270 ns | ~480 ns | 19% |
-| n 64, 250 MHz, 2 copies fed round-robin | ~135 ns effective | ~480 ns | ~40% |
-| n 32, 250 MHz | ~145 ns | ~350 ns | ~10-15% |
+| P2 | d8p1r1 n32 | 4 | 48 |
+| P1 | d16p1r1 n16 | 2 | 62 |
+| Q1 | d12p2r1m1 n16 | 2 | 63 |
+| R2 | d12p1r1 n32 | 4 | 77 |
+| Q2 / P3 / P4 / B1 | d16p2r1m1 n16 / d16p1r1 n32 / d24p1r1 n16 / d12p2r1 n16 | | 92 / 97 / 94 / 97 (too big) |
 
-Replicating the IP is standard in L1T, and io_stream is small enough to allow it. Confirm the TMUX period, the
-latency budget and the clock with the trigger group.
+## 5. Accuracy
 
-## 4. Recommendations
+| model | float AUC (all 404k jets) | QAT = HLS AUC (9984 jets) | 1/eB at eS 0.5 (9984 jets) |
+|---|---|---|---|
+| r7 (d32p2r1 n64) | 0.9786 (twamorka float) | 0.9744 | 123.9 |
+| **d12p2r1m1 n16, 50 ep + QAT (H1g)** | 0.9731 | **0.9685** | 94.1 |
+| d8p2r1 n16, 50 ep + QAT (H1r) | 0.9685 | 0.9653 | 79.4 |
+| d8p1r1 n32, 50 ep + QAT | 0.9631 | 0.9532 | 37.4 |
 
-1. **Synthesize the full-quant graph with io_stream.**
-   - Run `convert.py --onnx <fullQuant_clean.onnx> --synth`. Compare with the first run: 340k LUT, 628 BRAM,
-     1334 DSP.
-   - Then add a `--clock` option to `convert.py` and try 4 ns.
-2. **For io_parallel, train a smaller student,** with n x dim ≤ ~512 for the whole device, or ≤ ~200 for one SLR.
-3. **Cut the per-element cost:**
-   - fuse `ReLU -> shift -> Quant -> tanh` into one lookup;
-   - drop DATAFLOW at the top (FIFOs are 12-23% of the LUT);
-   - pack the conv multiplies into DSPs.
-4. **Run Vivado synthesis and implementation** on the chosen point for real timing (multi-SLR).
+- Training: float KD 50 epochs, then full-quant QAT 15 epochs (§7). QAT AUC comes from the exported QONNX graph via
+  `convert.py`, not from `qat_deepsets_eval.py` (which rebuilds full-quant models wrong).
+- 9-epoch single-GPU screens ranked d8p1r1 n32 first; full training put it last. Use screens only as smoke tests.
+- 9984 jets give AUC ±0.002 and 1/eB@0.5 ±20%. Rank with `csim_forward.py` on all 404k jets (README).
 
-Kept projects (`hls_prj/`, not in git): `mini_n16_phi32-16_rho16_pf8`, `mini_fq_n16_phi32-16_rho16_pf8`,
-`mini_ds_d16r2_phi1_rho1_n32_pf2`. Logs are in `logs/mini_*.txt`.
+## 6. Next steps
+
+1. **Vivado synthesis and place-and-route of H1g** at 360 MHz with a pblock on one SLR. csynth estimates 2.03 ns
+   against 2.78 ns, but routed timing at 66% LUT is the real question. The 200 MHz PF 4 build is the fallback.
+2. **Use the LUT headroom (66% → 80%):** d14p2r1m1 n16, or d12p2r1m1 at n 24 (PF 3). d16p2r1m1 n16 was 92% at
+   random weights. `--dsp-mult` on H1g would free ~5% LUT more.
+3. **Input range:** r7's input Quant saturates at 3.97 (log pT / log E are ~5); H1g learned ±8. Check whether a
+   fixed wider input range helps the small models too.
+
+## 7. Reproduce
+
+Training (nersc, branch `parallel-search`, on gpu_interactive):
+
+```
+SIZE=d12p2r1m1 N=16 setsid nohup salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 \
+    --gpus-per-node 4 -A m3246 bash scripts/ps_final.sbatch > <log> 2>&1 < /dev/null &
+# -> qonnx/fpga/qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx
+```
+
+`ps_final.sbatch` runs three stages:
+1. float KD: top_deepsets_distillnet_fpga recipe, `--act-layer relu --deepsets-fixed-n N`, 50 epochs on 1 node;
+2. `qat_deepsets.py --full-quant --tanh-in-max 4 --res-bits 10 --relu-uint`, 15 epochs at 5e-5;
+3. `qat_deepsets_export_qonnx.py`.
+
+HLS (rdsrv, `synthesis/`):
+
+```
+python convert.py --onnx onnx_graphs/qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx --name ps_d12p2r1m1_n16 \
+    --io-type io_parallel --strategy Latency --pf 2 --mult-limit-fix --clone-fanout --clock 2.78 --synth
+python csim_forward.py hls_prj/<project>          # all 404k test jets
+python csynth_summary.py hls_prj/<project> [log]  # II, clock, % SLR
+```
+
+Random-weight probes: `mini_parallel.py --distillnet ...` with the flags in the run log.
+
+Kept projects (`synthesis/hls_prj/`, not in git):
+- `deepsets_ps_d12p2r1m1_n16_io_parallel_pf2_clk2.78_mlf_clone` (H1g, current design);
+- `deepsets_ps_d8p2r1_n16_io_parallel_pf2_clk2.78_mlf_clone` (H1r);
+- `deepsets_distillnet_8bit_fullQuant_io_parallel_latency_rf1_pf2_clk2.78_mlf_clone_dsp` (H1f, d8p2r1 graph);
+- `deepsets_distillnet_8bit_fullQuant_r7_io_stream_resource_rf1` (r7 reference);
+- `deepsets_distillnet_8bit` (first QAT graph, io_stream baseline).

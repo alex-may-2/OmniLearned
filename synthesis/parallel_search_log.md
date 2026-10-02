@@ -1,6 +1,6 @@
 # parallel-search run log
 
-One row per run on either machine. Summary: `synthesis/io_parallel_slr_report.md`. II ns = II cycles x target clock.
+One row per run on either machine. Summary: `synthesis/io_parallel_report.md`. II ns = II cycles x target clock.
 Resources are % of one SLR (432k LUT, 864k FF, 3072 DSP, 1344 BRAM_18K) from csynth estimates.
 
 | tag | machine | family | k | clock | config | status | II cyc / ns | LUT / FF / DSP % SLR | est. clock | AUC | notes |

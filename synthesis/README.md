@@ -6,7 +6,7 @@ Notes for the agent or person running the FPGA step.
 - `convert.py` C-sim runs on Perlmutter or on SLAC rdsrv409.
 - Vitis HLS synthesis runs only on rdsrv409.
 
-**II ~ 25 ns search (2026-10-01):** `io_parallel_slr_report.md` has the per-copy-count winners. k=1 is d12p2r1m1 n16 (mlp_ratio 1) io_parallel at 360 MHz (II 22 ns, 66% SLR, AUC 0.9685); k=4 is d32p2r1 n16 io_stream at 240 MHz. Run log: `parallel_search_log.md`. New flags: `convert.py --clock --mult-limit-fix --clone-fanout`.
+**Single-SLR design (one jet every 25 ns, one SLR):** `io_parallel_report.md`. Current design: H1g, d12p2r1m1 n16 (mlp_ratio 1), io_parallel PF 2 at 360 MHz: II 22.2 ns, 66% of one SLR's LUT, HLS AUC 0.9697 on all 404k test jets. Run log: `parallel_search_log.md`. Flags: `convert.py --name --clock --mult-limit-fix --clone-fanout`.
 
 Graph changes are made on the PyTorch side in `tools/quantize/qat_deepsets.py`, which does the Brevitas
 wrapping (`network.py` stays Brevitas-free). Re-export with `tools/quantize/qat_deepsets_export_qonnx.py`.
@@ -278,57 +278,10 @@ Vitis HLS csynth (xcvu13p-flga2577-2-e, 5 ns clock, io_stream, Resource, ReuseFa
 These are HLS estimates; no Vivado logic synthesis has been run yet. They are the baseline for the
 full-quant graph.
 
-## io_parallel attempt (2026-09-28)
+## io_parallel
 
-Goal: a fully parallel design (all particles at once) for an L1-trigger-style 25 ns initiation interval.
-Note that 25 ns is the per-event II; L1 latency budgets are µs, and ~75-150 ns is realistic for a 7-layer net.
-
-- `convert.py --io-type io_parallel --strategy Latency --pf 16`: C-sim parity identical to io_stream, but
-  Vitis csynth hit the 1 h cap still in unroll/inline (110k instructions after compile/link).
-- PF gotcha: `ParallelizationFactor` must be set on `MatMul_<i>`; `MatmulConstToDense` overwrites any
-  `Dense_MatMul_<i>` config. PF only affects the 4 per-particle PointwiseConv1D layers, not elementwise layers.
-- Blocker: in io_parallel every elementwise layer runs on all 64x64 = 4096 values at once. hls4ml's io_parallel
-  `tanh` puts `#pragma HLS PIPELINE` at function level, so the 4096-entry float table init is unrolled (3 layers),
-  and 4096 parallel lookups into a 4096x18-bit table need ~7M LUT (or ~2000 BRAM copies per layer).
-
-The full-quant QAT plan (8-bit tanh input, 256-entry table, gamma folded, alpha as a power of 2) cuts the tanh cost
-to ~200k LUT. Still needed for io_parallel on top of it:
-
-1. **Smaller model.** 64 particles x phi (4-64-32-64-32) = ~410k MACs/jet. PF=16 needs ~100k parallel 8-bit
-   multipliers (~2M LUT, over the VU13P); the II is ~64/PF cycles, so PF=8 gives 40 ns (misses 25 ns).
-   Reaching II <= 5 cycles with a design that fits needs fewer particles (`--deepsets-fixed-n` 16-32) and/or a
-   narrower phi (see the mini-model scan below).
-2. **Tanh table storage.** HLS may replicate the ROM in BRAM for thousands of parallel reads; if csynth shows
-   that, patch the tanh template with `#pragma HLS BIND_STORAGE variable=tanh_table type=rom_1p impl=lutram`
-   (or build the table as logic).
-3. **Per-particle broadcast constants.** Any remaining ApplyAlpha (norm/scale) after a per-particle layer gets its
-   scale/bias broadcast to particles x channels (`n_filt = -1`, 4096 constants); collapse it to per-channel
-   (`n_filt` = channels) in `convert.py` if the new graph still has one.
-
-### Mini-model scan (`mini_parallel.py`)
-
-Random-weight QONNX DeepSets built in the script (8-bit power-of-2 Quant, ReLU, no biases/tanh, phi 4-64-32,
-rho 32-2, PF = n, io_parallel, Latency, 5 ns clock). C-sim is bit-exact vs qonnx. Independent of `convert.py`.
-
-| n | phi | PF | latency | II | LUT (device) |
-|---|---|---|---|---|---|
-| 16 | 64-32 | 4 | 165-175 ns | 40 ns | 743k (42%) |
-| 16 | 64-32 | 8 | 145-155 ns | 30 ns | 1.04M (60%) |
-| 32 | 64-32 | 8 | 205-215 ns | 60 ns | 1.39M (80%) |
-| 16 | 32-16 | 8 | 145-155 ns | 40 ns | 366k (21%) |
-
-DSP = 0 everywhere: all 8-bit products go into LUTs. The II comes from the pointwise conv layers (6-12 cycles
-unless PF = n). Fully parallel PF = n runs ran out of memory in Vitis (n16 phi 64-32) or were stopped for low
-memory (n16 phi 32-16); run one synth at a time.
-
-Full-quant follow-up (2026-09-29, `mini_parallel.py --full-quant / --distillnet`):
-- The full-quant elements cost 13-19% more LUT and 7-8 more cycles than the ReLU-only mini (same II). They do not
-  free room for more particles.
-- In io_parallel, the elementwise layers and FIFOs scale as ~1.2k LUT x n x dim, whatever the PF.
-- The largest real-topology point that fits is dim 16 / n 32 / PF 2: 57% LUT, II 80 ns, 0.54 µs.
-- For 64 particles, use io_stream.
-
-Full write-up, including io_stream L1T estimates: `io_parallel_report.md`.
+The 64-particle graph does not fit io_parallel; the single-SLR design uses a smaller student. History (tanh blocker,
+mini-model cost rules), the II and timing fixes, model knobs and the reproduce commands: `io_parallel_report.md`.
 
 ## Full test set comparison (2026-10-01)
 
@@ -340,10 +293,10 @@ hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quan
 | twamorka `distill_top_deepsets_distillnet_fpga_a05_T4` (d32p2r1, float) | 64 | float | 0.9253 | 0.9786 | 706 | 190 | 58.6 |
 | r7 (same model, full-quant QAT) | 64 | HLS | 0.9205 | 0.9757 | 540 | 143 | 47.7 |
 | d12p2r1m1 float KD (`ps_d12p2r1m1_n16_e50`) | 16 | float | - | 0.9731 | 377 | 119 | 43.4 |
-| **H1g** d12p2r1m1 full-quant (k=1 winner) | 16 | HLS | 0.9106 | **0.9697** | 278 | 91.5 | 35.7 |
+| **H1g** d12p2r1m1 full-quant (current design) | 16 | HLS | 0.9106 | **0.9697** | 278 | 91.5 | 35.7 |
 | d8p2r1 float KD (`ps_d8p2r1_n16_e50`) | 16 | float | - | 0.9685 | 274 | 88.1 | 33.0 |
 | twamorka `qat_top_deepsets_mac_d8p2r1_n16_a05_T4_8bit_po2` | 16 | Brevitas | 0.9086 | 0.9677 | 262 | 85.3 | 31.4 |
-| H1r d8p2r1 full-quant (previous k=1 winner) | 16 | HLS | 0.9074 | 0.9666 | 234 | 78.1 | 30.0 |
+| H1r d8p2r1 full-quant (smaller fallback) | 16 | HLS | 0.9074 | 0.9666 | 234 | 78.1 | 30.0 |
 
 - Rejection falls much faster than AUC. From the float d32 n64 model to H1g, AUC drops 0.009 and
   1/eB at eS=0.5 roughly halves (190 to 91.5).
@@ -361,37 +314,20 @@ hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quan
 
 ## Next steps
 
-Roughly in priority order.
-
-### Synthesis of the full-quant graph
-
-1. On rdsrv409, run `convert.py --synth` on the full-quant graph (io_stream, and io_parallel PF=16 with
-   the 1 h cap). Compare against the baseline above.
-2. Run Vivado logic synthesis (`hls_model.build(..., vsynth=True)`) for real post-synthesis resource and
-   timing numbers instead of HLS estimates.
+Roughly in priority order. Hardware next steps for H1g (Vivado P&R, LUT headroom): `io_parallel_report.md` §6.
 
 ### Further quantization (NERSC side, needs QAT)
 
-3. **Narrower pre-requantization sums.** The residual `Add`s are still computed at the MatMul accumulator
+1. **Narrower pre-requantization sums.** The residual `Add`s are still computed at the MatMul accumulator
    width (24-bit) before the 10-bit `Quant`. An output quantizer on `phi.fc2` / `rho.fc2` would shrink
    the adders; check whether HLS already trims them first.
-4. **7-bit unsigned inputs after ReLU** (same resolution as the old signed 8-bit).
-5. **Optional output quantizer** on the logits (now `fixed<22,8>`), if the output port width matters
+2. **7-bit unsigned inputs after ReLU** (same resolution as the old signed 8-bit).
+3. **Optional output quantizer** on the logits (now `fixed<22,8>`), if the output port width matters
    downstream.
-6. **Lower weight bit-widths** (e.g. 6-bit, or 4-bit where tolerated) for DSP/LUT savings. This is a
+4. **Lower weight bit-widths** (e.g. 6-bit, or 4-bit where tolerated) for DSP/LUT savings. This is a
    separate precision-vs-AUC scan.
-
-### Resources / latency (HLS side)
-
-7. Raise `ReuseFactor` (e.g. 2, 4, 8) on the per-particle PointwiseConv1D layers to cut DSP/LUT, traded
-   against latency and II.
-8. Check whether the BRAM usage is mostly stream FIFOs. If so, run hls4ml FIFO depth optimization (the
-   `fifo_depth_optimization` flow).
-9. Try a different clock target if the application needs it.
-10. Revisit the fixed batch dim of 64 in the export if the target interface wants per-jet streaming. The
-    HLS model already processes one jet per call.
 
 ### Housekeeping
 
-11. Report the six hls4ml bugs, the ignored `Precision["table"]` and the missing `GlobalPooling1D`/ReLU
+5. Report the six hls4ml bugs, the ignored `Precision["table"]` and the missing `GlobalPooling1D`/ReLU
     type inference upstream (or to the qibin2020 fork), so `convert.py` can drop its monkeypatches.
