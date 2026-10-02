@@ -160,7 +160,7 @@ Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 
 ## 7. Reproduce
 
-Training (nersc, branch `parallel-search`, on gpu_interactive):
+Training (nersc, branch `synthesis`, on gpu_interactive):
 
 ```
 SIZE=d12p2r1m1 N=16 setsid nohup salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 \

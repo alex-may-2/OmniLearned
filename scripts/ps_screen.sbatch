@@ -1,5 +1,5 @@
 #!/bin/bash
-# parallel-search float KD screen (synthesis/PARALLEL_SEARCH_PLAN.md, Phase 2): the top_deepsets_distillnet_fpga
+# Float KD screen (smoke test only; see synthesis/io_parallel_report.md): the top_deepsets_distillnet_fpga
 # KD recipe (teacher fine_tune_top_l, a0.5/b0.5/T4, lr 5e-4, wd 0.5) at another size / particle count, on one node,
 # then a test-set evaluate and one AUC line in $BASE/logs/ps/screens.txt.
 #

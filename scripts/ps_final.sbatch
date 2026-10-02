@@ -1,5 +1,5 @@
 #!/bin/bash
-# parallel-search finalist chain (synthesis/PARALLEL_SEARCH_PLAN.md, Phase 3), one node:
+# Single-SLR finalist chain (see synthesis/io_parallel_report.md), one node:
 #   1. float KD, top_deepsets_distillnet_fpga recipe, EPOCH (default 50) epochs   -> $FLOAT_TAG
 #   2. 8-bit full-quant QAT, r7 flags (--full-quant --tanh-in-max 4 --res-bits 10 --relu-uint), 15 ep at 5e-5
 #   3. QONNX export -> $BASE/qonnx/fpga/$QAT_TAG_clean.onnx (scp -3 to rdsrv; convert.py gives qonnx + HLS AUC)
