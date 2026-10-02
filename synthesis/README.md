@@ -291,13 +291,17 @@ hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quan
 | model | N | run as | acc | AUC | 1/eB @ eS=0.3 | @ 0.5 | @ 0.7 |
 |---|---|---|---|---|---|---|---|
 | twamorka `distill_top_deepsets_distillnet_fpga_a05_T4` (d32p2r1, float) | 64 | float | 0.9253 | 0.9786 | 706 | 190 | 58.6 |
+| first QAT graph `_8bit` (same model, weights + Linear inputs only) | 64 | HLS | 0.9165 | 0.9756 | 523 | 143 | 46.3 |
 | r7 (same model, full-quant QAT) | 64 | HLS | 0.9205 | 0.9757 | 540 | 143 | 47.7 |
 | d12p2r1m1 float KD (`ps_d12p2r1m1_n16_e50`) | 16 | float | - | 0.9731 | 377 | 119 | 43.4 |
 | **H1g** d12p2r1m1 full-quant (current design) | 16 | HLS | 0.9106 | **0.9697** | 278 | 91.5 | 35.7 |
 | d8p2r1 float KD (`ps_d8p2r1_n16_e50`) | 16 | float | - | 0.9685 | 274 | 88.1 | 33.0 |
 | twamorka `qat_top_deepsets_mac_d8p2r1_n16_a05_T4_8bit_po2` | 16 | Brevitas | 0.9086 | 0.9677 | 262 | 85.3 | 31.4 |
 | H1r d8p2r1 full-quant (smaller fallback) | 16 | HLS | 0.9074 | 0.9666 | 234 | 78.1 | 30.0 |
+| H1f = H1r + `--dsp-mult` | 16 | HLS | 0.9074 | 0.9666 | 234 | 78.1 | 30.0 |
 
+- The first QAT graph is not bit-exact in HLS (97.5% argmax agreement), yet on all 404k jets its HLS AUC equals
+  r7's. Its C-sim runs at ~190 jets/s (wide types, 4096-entry tanh), so the full set takes ~35 min.
 - Rejection falls much faster than AUC. From the float d32 n64 model to H1g, AUC drops 0.009 and
   1/eB at eS=0.5 roughly halves (190 to 91.5).
 - Shrinking costs more than quantizing. d32 n64 float to d12 n16 float costs 37% of 1/eB@0.5;
