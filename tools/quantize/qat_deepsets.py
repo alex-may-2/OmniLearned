@@ -14,25 +14,59 @@ this file so importing the shared `omnilearned` package elsewhere (e.g. the
 omnilearned-clean env used by ongoing training jobs, which doesn't have
 Brevitas installed) is completely unaffected.
 
-Must be run with the omnilearned-fpga/env python (has Brevitas/QONNX/hls4ml;
-omnilearned-clean/env does not).
-
 QAT is always full-quant: power-of-2 weight/activation scales, Int16 biases,
 QuantDynamicTanh (gamma folded, po2 alpha), and by default a fixed tanh input
 range (--tanh-in-max 4), a quantized residual stream and pool (--res-bits 10)
 and unsigned inputs after ReLU (--relu-uint). Every op between Quant nodes is
 then exact in fixed point, so the exported QONNX graph is bit-exact in hls4ml.
-This needs a fixed-N body (--deepsets-fixed-n at float training).
 
-Usage:
-    /global/homes/t/twamorka/omnilearned-fpga/env/bin/python qat_deepsets.py \
+Workflow
+--------
+1. Float KD training (omnilearned train) of a fixed-N ReLU DeepSets student:
+   --arch deep-sets --size <size> --act-layer relu --deepsets-fixed-n <N>
+   --distill ... --save-tag <float_tag>. Full-quant needs the fixed-N body.
+2. QAT (this script): warm-starts from <float_tag>, writes <qat_tag>.
+3. QONNX export: qat_deepsets_export_qonnx.py --tag <qat_tag>
+   Test-set eval: qat_deepsets_eval.py --tag <qat_tag>
+   Both rebuild the model from the QAT checkpoint's arch_config; no shape flags.
+
+Inputs and outputs
+------------------
+--tag <float_tag>      float checkpoint to start from: <--init-dir>/best_model_<float_tag>.pt
+--save-tag <qat_tag>   QAT checkpoint written to <--output-dir>/best_model_<qat_tag>.pt
+                       (plus last_model_* and training_*.json)
+--init-dir/--output-dir default to /pscratch/sd/t/twamorka/omnilearned/checkpoints/.
+
+The model shape is read from the float checkpoint's arch_config, which train.py
+saves. A float checkpoint saved before arch_config existed (e.g.
+distill_top_deepsets_distillnet_fpga_a05_T4) stops with an error unless you pass
+--size, --deepsets-fixed-n and, if not relu, --act-layer.
+
+The KD recipe defaults (--distill-alpha 0.5 --distill-beta 0.5 --distill-t 4,
+teacher fine_tune_top_l) and the schedule defaults (15 epochs, lr 5e-5, wd 0.5,
+1000 iterations/epoch) are the ones every full-quant graph so far used.
+
+Examples
+--------
+Float checkpoint with arch_config (any train.py run since arch_config was added):
+    python tools/quantize/qat_deepsets.py \
+        --tag ps_d12p2r1m1_n16_e50 \
+        --save-tag qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant
+
+Older float checkpoint without arch_config (the distillnet student, N = 64):
+    python tools/quantize/qat_deepsets.py \
         --tag distill_top_deepsets_distillnet_fpga_a05_T4 \
-        --save-tag qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant \
-        --epochs 15 --lr 5e-5
+        --size distillnet --deepsets-fixed-n 64 \
+        --save-tag qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant
 
-The model shape is read from the float checkpoint's arch_config. Float
-checkpoints saved before arch_config existed also need --size, --act-layer and
---deepsets-fixed-n.
+Multi-GPU (one node, 4 GPUs, ~1 h for d12 N=16) from the repo root, inside an
+allocation such as
+salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 --gpus-per-node 4 -A m3246:
+    srun bash -c "source scripts/export_ddp.sh; python tools/quantize/qat_deepsets.py --tag ... --save-tag ..."
+scripts/qat_train_deepsets_distillnet_fpga_8bit.sh is a ready-made launcher for
+the distillnet example.
+
+Use the omnilearned-fpga env's python (it has Brevitas); "python" above means that one.
 """
 
 import argparse
@@ -254,8 +288,8 @@ def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", required=True, help="base float checkpoint tag to warm-start from")
-    ap.add_argument("--save-tag", required=True, help="new tag for the QAT checkpoint")
+    ap.add_argument("--tag", required=True, help="float checkpoint to start from: <init-dir>/best_model_<tag>.pt")
+    ap.add_argument("--save-tag", required=True, help="tag of the QAT checkpoint written to <output-dir>")
     ap.add_argument("--init-dir", default=CHECKPOINT_DIR, help="dir holding the float --tag checkpoint")
     ap.add_argument("--output-dir", default=CHECKPOINT_DIR, help="dir the QAT checkpoint is written to")
     ap.add_argument("--bits", type=int, default=8)
