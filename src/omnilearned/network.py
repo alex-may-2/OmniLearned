@@ -916,6 +916,7 @@ class DeepSets(nn.Module):
         num_interaction_layers=0,
         interaction_k=0,
         fixed_n=0,
+        rho_mlp_ratio=None,  # rho (head) blocks' mlp_ratio; None = mlp_ratio
     ):
         super().__init__()
         if mode not in ["classifier", "pretrain"]:
@@ -948,7 +949,7 @@ class DeepSets(nn.Module):
         self.classifier = DeepSetsHead(
             base_dim=base_dim,
             num_layers=num_rho_layers,
-            mlp_ratio=mlp_ratio,
+            mlp_ratio=rho_mlp_ratio or mlp_ratio,
             mlp_drop=mlp_drop,
             num_classes=num_classes,
             norm_layer=norm_layer,

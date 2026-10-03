@@ -15,6 +15,10 @@
 #   BASE      output root: checkpoints/, qonnx/fpga/, logs/fullquant/ (default $PSCRATCH/omnilearned)
 #   FPGA_ENV  conda env with Brevitas/QONNX (default the m2616 omnilearned-fpga env)
 #   EPOCH, FLOAT_TAG, QAT_TAG, TEACHER, DATA
+#   QAT_ARGS  extra qat_deepsets.py args, appended so they override the defaults (e.g. "--epochs 30")
+#   SRUN_OPTS step placement, e.g. "-N1 -n4 -c 32 --exact" for one chain per node of a multi-node allocation
+#             (scripts/fullquant_multi.sh); each step then rendezvouses on its own node
+#   EVAL=1    stage 4: qat_deepsets_eval.py on the full test set -> $LOGS/${QAT_TAG}_eval.txt
 #SBATCH -A m3246
 #SBATCH -C gpu
 #SBATCH -q regular
@@ -45,12 +49,16 @@ export PATH=$FPGA_ENV/bin:$PATH
 export PYTHONPATH=$REPO/src
 export HDF5_USE_FILE_LOCKING=FALSE NCCL_DEBUG=WARN TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 KD="--distill-alpha 0.5 --distill-beta 0.5 --distill-t 4"
+SRUN_OPTS=${SRUN_OPTS:-}
+DDP="source $REPO/scripts/export_ddp.sh"
+# export_ddp.sh points every step at the allocation's first node; one chain per node needs its own rendezvous.
+[ -n "$SRUN_OPTS" ] && DDP+='; export MASTER_ADDR=$(hostname) MASTER_PORT=$((29500 + SLURM_JOB_ID % 5000 + SLURM_STEP_ID % 1000))'
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOGS/${FLOAT_TAG}.log"; }
 
 log "job $SLURM_JOB_ID size=$SIZE n=$N float=$FLOAT_TAG qat=$QAT_TAG repo=$REPO base=$BASE"
 if [ ! -f "$CKPT/training_${FLOAT_TAG}.json" ]; then
     log "[1/3] float KD $EPOCH epochs"
-    srun -l -u bash -c "source $REPO/scripts/export_ddp.sh; omnilearned train -o $CKPT --save-tag $FLOAT_TAG \
+    srun -l -u $SRUN_OPTS bash -c "$DDP; omnilearned train -o $CKPT --save-tag $FLOAT_TAG \
         --dataset top --mode classifier --num-classes 2 --path $DATA --arch deep-sets \
         --size $SIZE --act-layer relu --deepsets-fixed-n $N --batch 128 \
         --iterations 1000 --epoch $EPOCH --lr 5e-4 --wd 0.5 --num-workers 4 --distill --teacher-labels-dir $TEACHER \
@@ -59,10 +67,10 @@ fi
 
 if [ ! -f "$LOGS/${QAT_TAG}.done" ]; then
     log "[2/3] full-quant QAT"
-    srun -l -u bash -c "source $REPO/scripts/export_ddp.sh; python tools/quantize/qat_deepsets.py --tag $FLOAT_TAG \
+    srun -l -u $SRUN_OPTS bash -c "$DDP; python tools/quantize/qat_deepsets.py --tag $FLOAT_TAG \
         --save-tag $QAT_TAG --init-dir $CKPT --output-dir $CKPT --epochs 15 --warmup-epoch 1 \
         --lr 5e-5 --wd 0.5 --batch 128 --iterations 1000 --num-workers 4 --teacher-dir $TEACHER \
-        --teacher-tag fine_tune_top_l $KD" || { log "QAT failed"; exit 1; }
+        --teacher-tag fine_tune_top_l $KD ${QAT_ARGS:-}" || { log "QAT failed"; exit 1; }
     touch "$LOGS/${QAT_TAG}.done"
 fi
 
@@ -70,3 +78,10 @@ log "[3/3] QONNX export"
 python tools/quantize/qat_deepsets_export_qonnx.py --tag "$QAT_TAG" --checkpoint-dir "$CKPT" \
     --out-dir "$BASE/qonnx/fpga/" || { log "export failed"; exit 1; }
 log "done: $BASE/qonnx/fpga/${QAT_TAG}_clean.onnx"
+
+if [ -n "${EVAL:-}" ]; then
+    log "[4/4] test-set eval"
+    srun -u $SRUN_OPTS -n 1 -c 32 bash -c "$DDP; python tools/quantize/qat_deepsets_eval.py --tag $QAT_TAG \
+        --checkpoint-dir $CKPT" > "$LOGS/${QAT_TAG}_eval.txt" 2>&1 || log "eval failed"
+    log "eval $QAT_TAG: $(grep -E 'Accuracy|AUC|1/FPR' "$LOGS/${QAT_TAG}_eval.txt" | tr -s ' ' | paste -sd ';')"
+fi
