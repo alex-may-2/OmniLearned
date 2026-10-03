@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--checkpoint-dir", default=CHECKPOINT_DIR, help="dir holding the QAT --tag checkpoint")
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--data-path", default=DATA_PATH, help="dataset root holding top/")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
@@ -56,7 +57,7 @@ def main():
     print(f"Loaded {args.tag} ({cfg['size']}, fixed_n={cfg['fixed_n']}, quant={cfg['quant']}): {n_params:,} params")
 
     test_loader = load_data(
-        "top", dataset_type="test", use_cond=True, path=DATA_PATH, batch=args.batch,
+        "top", dataset_type="test", use_cond=True, path=args.data_path, batch=args.batch,
         num_workers=args.num_workers, rank=0, size=1, mode="classifier", shuffle=False,
     )
 

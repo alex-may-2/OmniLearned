@@ -300,6 +300,7 @@ def main():
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--iterations", type=int, default=1000)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--data-path", default=DATA_PATH, help="dataset root holding top/ (e.g. a $PSCRATCH copy)")
     ap.add_argument("--teacher-dir", default=TEACHER_DIR_L)
     ap.add_argument("--teacher-tag", default="fine_tune_top_l")
     ap.add_argument("--distill-alpha", type=float, default=0.5)
@@ -370,12 +371,12 @@ def main():
         print(f"Wrapped {n_qlin} nn.Linear layers as Brevitas QuantLinear ({args.bits}-bit)")
 
     train_loader = load_data(
-        "top", dataset_type="train", use_cond=True, path=DATA_PATH, batch=args.batch,
+        "top", dataset_type="train", use_cond=True, path=args.data_path, batch=args.batch,
         num_workers=args.num_workers, rank=rank, size=size, mode="classifier",
         teacher_labels_dir=args.teacher_dir, teacher_tag=args.teacher_tag,
     )
     val_loader = load_data(
-        "top", dataset_type="val", use_cond=True, path=DATA_PATH, batch=args.batch,
+        "top", dataset_type="val", use_cond=True, path=args.data_path, batch=args.batch,
         num_workers=args.num_workers, rank=rank, size=size, mode="classifier",
         teacher_labels_dir=args.teacher_dir, teacher_tag=args.teacher_tag,
     )

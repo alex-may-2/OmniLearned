@@ -70,7 +70,7 @@ if [ ! -f "$LOGS/${QAT_TAG}.done" ]; then
     srun -l -u $SRUN_OPTS bash -c "$DDP; python tools/quantize/qat_deepsets.py --tag $FLOAT_TAG \
         --save-tag $QAT_TAG --init-dir $CKPT --output-dir $CKPT --epochs 15 --warmup-epoch 1 \
         --lr 5e-5 --wd 0.5 --batch 128 --iterations 1000 --num-workers 4 --teacher-dir $TEACHER \
-        --teacher-tag fine_tune_top_l $KD ${QAT_ARGS:-}" || { log "QAT failed"; exit 1; }
+        --teacher-tag fine_tune_top_l $KD --data-path $DATA ${QAT_ARGS:-}" || { log "QAT failed"; exit 1; }
     touch "$LOGS/${QAT_TAG}.done"
 fi
 
@@ -82,6 +82,6 @@ log "done: $BASE/qonnx/fpga/${QAT_TAG}_clean.onnx"
 if [ -n "${EVAL:-}" ]; then
     log "[4/4] test-set eval"
     srun -u $SRUN_OPTS -n 1 -c 32 bash -c "$DDP; python tools/quantize/qat_deepsets_eval.py --tag $QAT_TAG \
-        --checkpoint-dir $CKPT" > "$LOGS/${QAT_TAG}_eval.txt" 2>&1 || log "eval failed"
+        --checkpoint-dir $CKPT --data-path $DATA" > "$LOGS/${QAT_TAG}_eval.txt" 2>&1 || log "eval failed"
     log "eval $QAT_TAG: $(grep -E 'Accuracy|AUC|1/FPR' "$LOGS/${QAT_TAG}_eval.txt" | tr -s ' ' | paste -sd ';')"
 fi
