@@ -49,6 +49,9 @@ p.add_argument("--clock", type=float, default=5.0, help="target clock period in 
 p.add_argument("--mult-limit-fix", action="store_true", help="io_parallel: conv multiplier limit covers all PF pixels")
 p.add_argument("--clone-fanout", action="store_true", help="io_parallel: one copy per reader of each residual skip array")
 p.add_argument("--dsp-mult", action="store_true", help="bind all multiplies to DSPs (config_op mul -impl dsp)")
+p.add_argument("--dsp-add", action="store_true", help="bind adds/subs to DSPs too (config_op add/sub -impl dsp)")
+p.add_argument("--reshape-channels", action="store_true",
+               help="io_parallel: ARRAY_RESHAPE the inter-layer arrays (one DATAFLOW channel per array, not per element)")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
 p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
@@ -70,6 +73,10 @@ if args.clone_fanout:
     OUT_DIR += "_clone"
 if args.dsp_mult:
     OUT_DIR += "_dsp"
+if args.dsp_add:
+    OUT_DIR += "_dspadd"
+if args.reshape_channels:
+    OUT_DIR += "_rsh"
 
 # hls4ml bug: Layer._validate_attributes wraps ApplyAlpha's scale/bias_precision in NamedType, and
 # ScaleDownAdd rebuilds ApplyAlpha from those attributes, which update_precision rejects. Unwrap it.
@@ -314,13 +321,36 @@ def clone_fanout(cpp, top):
     print(f"[clone] {n} fan-out arrays split in {cpp}")
 
 
+def reshape_channels(cpp):
+    """Copied from mini_parallel.py. io_parallel DATAFLOW: each element of a completely partitioned inter-layer array is its own channel (a depth-2
+    FIFO), ~2,900 FIFOs and 64k LUT of FIFO control in H1g. ARRAY_RESHAPE packs each array into one wide word, so each
+    layer boundary is one channel. Pragmas only: the arithmetic (and C-sim) are unchanged.
+    Arrays a pointwise conv reads or writes stay partitioned: the conv indexes them per PF partition, and on a
+    reshaped word that indexing costs ~400k LUT per conv (K1 probe, 2026-10-03)."""
+    s = open(cpp).read()
+    k = s.index("// hls-fpga-machine-learning insert layers")
+    conv_io = {a.strip() for c in re.findall(r"pointwise_conv_1d_cl<[^>]*>\(([^,]+,[^,]+),", s) for a in c.split(",")}
+    body, n = re.subn(r"#pragma HLS ARRAY_PARTITION variable=(layer\w+) complete dim=0",
+                      lambda m: m[0] if m[1] in conv_io else f"#pragma HLS ARRAY_RESHAPE variable={m[1]} complete dim=0", s[k:])
+    n -= sum(f"variable={a} " in s[k:] for a in conv_io)
+    open(cpp, "w").write(s[:k] + body)
+    print(f"[reshape] {n} inter-layer arrays reshaped in {cpp}")
+
+
 if args.clone_fanout:
     clone_fanout(f"{OUT_DIR}/firmware/deepsets.cpp", "deepsets")
+if args.reshape_channels:
+    reshape_channels(f"{OUT_DIR}/firmware/deepsets.cpp")
 if args.dsp_mult:  # synthesis-only, as mini_parallel.py --dsp-mult
     tcl, clk = f"{OUT_DIR}/build_prj.tcl", "create_clock -period $clock_period -name default"
     src = open(tcl).read()
     assert clk in src
     open(tcl, "w").write(src.replace(clk, clk + "\nconfig_op mul -impl dsp"))
+if args.dsp_add:  # synthesis-only, as mini_parallel.py --dsp-add
+    tcl, clk = f"{OUT_DIR}/build_prj.tcl", "create_clock -period $clock_period -name default"
+    src = open(tcl).read()
+    assert clk in src
+    open(tcl, "w").write(src.replace(clk, clk + "\nconfig_op add -impl dsp\nconfig_op sub -impl dsp"))
 
 
 def run_both(x):

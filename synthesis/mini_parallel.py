@@ -64,6 +64,7 @@ p.add_argument("--full-quant", action="store_true", help="Int16 biases + quantiz
 p.add_argument("--distillnet", action="store_true", help="real student topology, full-quant elements")
 p.add_argument("--dim", type=int, default=32, help="--distillnet: base_dim")
 p.add_argument("--ratio", type=int, default=2, help="--distillnet: mlp_ratio")
+p.add_argument("--rho-ratio", type=int, default=None, help="--distillnet: rho blocks' mlp_ratio (default --ratio)")
 p.add_argument("--phi-blocks", type=int, default=1, help="--distillnet: residual phi blocks after the embed")
 p.add_argument("--rho-blocks", type=int, default=1, help="--distillnet: residual rho blocks")
 p.add_argument("--pf", type=int, default=None, help="ParallelizationFactor of the per-particle layers (default: n)")
@@ -75,6 +76,9 @@ p.add_argument("--clock", type=float, default=5.0, help="target clock period in 
 p.add_argument("--rf", type=int, default=1, help="ReuseFactor of the per-particle layers")
 p.add_argument("--mult-limit-fix", action="store_true", help="conv multiplier limit covers all n_pixels of a partition")
 p.add_argument("--dsp-mult", action="store_true", help="bind all multiplies to DSPs (config_op mul -impl dsp)")
+p.add_argument("--dsp-add", action="store_true", help="bind adds/subs to DSPs too (config_op add/sub -impl dsp)")
+p.add_argument("--reshape-channels", action="store_true",
+               help="io_parallel: ARRAY_RESHAPE the inter-layer arrays (one DATAFLOW channel per array, not per element)")
 p.add_argument("--pipeline-style", choices=["pipeline", "dataflow"], default=None, help="hls4ml Model PipelineStyle")
 p.add_argument("--pipeline-ii", type=int, default=None, help="with --pipeline-style pipeline: top-level II (hls4ml PipelineInterval)")
 p.add_argument("--strategy", choices=["Latency", "Resource"], default=None, help="default: Resource for io_stream, else Latency")
@@ -88,9 +92,11 @@ stream = args.io_type == "io_stream"
 if args.distillnet:
     OUT_DIR = f"hls_prj/mini_ds_d{args.dim}r{args.ratio}_phi{args.phi_blocks}_rho{args.rho_blocks}_n{args.n}_pf{pf}"
     OUT_DIR += f"_q{args.res_bits}{'u' if args.relu_uint else ''}{'_noembdyt' if args.no_embed_dyt else ''}"
+    OUT_DIR += f"_h{args.rho_ratio}" if args.rho_ratio and args.rho_ratio != args.ratio else ""
 else:
     OUT_DIR = f"hls_prj/mini{'_fq' if fq else ''}_n{args.n}_phi{'-'.join(map(str, phi))}_rho{'-'.join(map(str, rho))}_pf{pf}"
 levers = [(f"rf{args.rf}", args.rf > 1), ("mlf", args.mult_limit_fix), ("dsp", args.dsp_mult)]
+levers += [("dspadd", args.dsp_add), ("rsh", args.reshape_channels)]
 levers += [(str(args.pipeline_style), args.pipeline_style), ("stream", stream), (f"clk{args.clock:g}", args.clock != 5)]
 levers += [(f"ii{args.pipeline_ii}", args.pipeline_ii)]
 levers += [(str(args.strategy).lower(), args.strategy and args.strategy != ("Resource" if stream else "Latency"))]
@@ -297,7 +303,7 @@ if args.distillnet:
     n_pp = count("MatMul")
     x = res_quant(pool(x), 2.0**-9)
     for _ in range(args.rho_blocks):
-        x = residual(x, d, hidden, 8.0, 2.0**-7)
+        x = residual(x, d, (args.rho_ratio or args.ratio) * d, 8.0, 2.0**-7)
     out_scale = TANH_OUT_SCALE if args.res_bits else ACT_SCALE  # r7: 8-bit 1/128 before the output Linear
     matmul(quant(x, out_scale, 1), d, 2, out="logits", in_scale=out_scale)
 else:
@@ -459,11 +465,32 @@ def clone_fanout(cpp):
     print(f"[clone] {n} fan-out arrays split in {cpp}")
 
 
+def reshape_channels(cpp):
+    """io_parallel DATAFLOW: each element of a completely partitioned inter-layer array is its own channel (a depth-2
+    FIFO), ~2,900 FIFOs and 64k LUT of FIFO control in H1g. ARRAY_RESHAPE packs each array into one wide word, so each
+    layer boundary is one channel. Pragmas only: the arithmetic (and C-sim) are unchanged.
+    Arrays a pointwise conv reads or writes stay partitioned: the conv indexes them per PF partition, and on a
+    reshaped word that indexing costs ~400k LUT per conv (K1 probe, 2026-10-03)."""
+    s = open(cpp).read()
+    k = s.index("// hls-fpga-machine-learning insert layers")
+    conv_io = {a.strip() for c in re.findall(r"pointwise_conv_1d_cl<[^>]*>\(([^,]+,[^,]+),", s) for a in c.split(",")}
+    body, n = re.subn(r"#pragma HLS ARRAY_PARTITION variable=(layer\w+) complete dim=0",
+                      lambda m: m[0] if m[1] in conv_io else f"#pragma HLS ARRAY_RESHAPE variable={m[1]} complete dim=0", s[k:])
+    n -= sum(f"variable={a} " in s[k:] for a in conv_io)
+    open(cpp, "w").write(s[:k] + body)
+    print(f"[reshape] {n} inter-layer arrays reshaped in {cpp}")
+
+
 if not stream:
     clone_fanout(f"{OUT_DIR}/firmware/mini.cpp")
+if args.reshape_channels:
+    reshape_channels(f"{OUT_DIR}/firmware/mini.cpp")
 if args.dsp_mult:
     clk = "create_clock -period $clock_period -name default"
     patch(f"{OUT_DIR}/build_prj.tcl", clk, clk + "\nconfig_op mul -impl dsp")
+if args.dsp_add:
+    clk = "create_clock -period $clock_period -name default"
+    patch(f"{OUT_DIR}/build_prj.tcl", clk, clk + "\nconfig_op add -impl dsp\nconfig_op sub -impl dsp")
 
 # --- C-sim parity vs qonnx on random inputs (inputs on the 8-bit grid) ---
 xin = (np.round(rng.normal(0, 2, (BATCH, args.n, 4)) / IN_SCALE) * IN_SCALE).clip(-128 * IN_SCALE, 127 * IN_SCALE).astype(np.float32)
