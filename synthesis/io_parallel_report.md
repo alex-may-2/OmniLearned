@@ -9,6 +9,15 @@ Run log, one row per run (history, including abandoned multi-copy builds): `synt
 
 II, the one-SLR fit and the clock are hard limits. AUC is soft (reference 0.9644 = r7 − 0.01 on the 9984-jet subset).
 
+**Open issue (2026-10-03): io_parallel RTL differs from C-sim.** C/RTL co-simulation of H1g (as built on
+2026-10-01), H1g + `--reshape-channels` and H2-d16s4 gives RTL logits that differ from the C testbench on the same
+jets (max |d logit| ~3, argmax agreement 0.965 on 200 jets); C-sim itself matches QONNX bit for bit. The r7
+io_stream project is exact in cosim (50 jets), and an input-capture process in front of the first conv does not
+change the H1g result. Mini-graph bisection (d8 n16, random weights): embed only is almost exact (1 of 100 rows off
+by ~1 output LSB); adding the embed DyT/tanh block breaks most rows. The tanh ROM contents are correct. The cause is
+still open, so AUCs here are C-sim (= QONNX) numbers, not yet confirmed on RTL. Repro: `/tmp/alexmay_ps/cosim.sh`
+(rows COSIM-* and BIS-* in the run log).
+
 **Caveat.** All hardware numbers are Vitis HLS 2024.1 csynth estimates. There is no Vivado place and route. Clocks of
 320 MHz and above are **csynth-only, not P&R-confirmed**.
 
@@ -196,8 +205,8 @@ Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 
 ## 6. Next steps
 
-0. (2026-10-03) More seeds of d16 n16 and of the r2 shapes (run log RC/RD rows); pick the best seed on validation
-   loss. Check `--reshape-channels` in C/RTL co-simulation once, since it changes the channel structure.
+0. (2026-10-03) **Find the io_parallel RTL/C mismatch** (see the open issue above): cut the mini graph after the
+   DyT block (normalize, tanh) and co-simulate each layer output. Then more d16 / d14 r2 seeds, best on validation.
 
 1. **Vivado synthesis and place-and-route of H1g** at 360 MHz with a pblock on one SLR. csynth estimates 2.03 ns
    against 2.78 ns, but routed timing at 66% LUT is the real question. The 200 MHz PF 4 build is the fallback.
