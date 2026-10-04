@@ -16,13 +16,17 @@ II, the one-SLR fit and the clock are hard limits. AUC is soft (reference 0.9644
 
 | design (trained, full-quant) | build | II cycles / ns | LUT / FF / DSP % SLR | clock est. | latency | AUC 9984 jets | AUC / 1/eB@0.5, all 404k jets |
 |---|---|---|---|---|---|---|---|
-| **H1g: d12p2r1m1, n 16** (mlp_ratio 1) | PF 2, 360 MHz | 8 / 22.2 | 66 / 21 / 0 | 2.03 ns | 100 cyc = 278 ns | **0.9685** | **0.9697 / 91.5** |
+| **H2-d16: d16p2r1m1, n 16** (2026-10-03) | PF 2, 360 MHz, `--reshape-channels --dsp-mult` | 8 / 22.2 | 74 / 25 / 18 | 1.96 ns | 34 cyc = 94 ns | 0.9699 | **0.9703 / 99.4** |
+| H1g + `--reshape-channels` | PF 2, 360 MHz | 8 / 22.2 | 57 / 19 / 0 | 2.03 ns | 34 cyc = 94 ns | 0.9685 | 0.9697 / 91.5 |
+| H1g: d12p2r1m1, n 16 (mlp_ratio 1) | PF 2, 360 MHz | 8 / 22.2 | 66 / 21 / 0 | 2.03 ns | 100 cyc = 278 ns | 0.9685 | 0.9697 / 91.5 |
 | H1r: d8p2r1, n 16 | PF 2, 360 MHz | 8 / 22.2 | 59 / 18 / 0 | 1.96 ns | 275 ns | 0.9653 | 0.9666 / 78.1 |
 | H1f: d8p2r1, n 16 + `--dsp-mult` | PF 2, 360 MHz | 8 / 22.2 | 56 / 18 / 10 | 1.96 ns | 275 ns | 0.9653 | 0.9666 / 78.1 (identical to H1r) |
 | d8p2r1, n 16 | PF 4, 200 MHz | 4 / 20.0 | 67 / 15 / 0 | 3.65 ns | 300 ns | 0.9653 | |
 | d8p2r1, n 16 | PF 2, 320 MHz | 8 / 25.0 | 57 / 17 / 0 | 2.28 ns | | 0.9653 | |
 
-- **H1g is the current design.** It meets all three limits, and it is bit-exact (max |Δ logit| = 0) between QONNX and
+- **H2-d16 is the current design (2026-10-03).** The two LUT knobs of §3b free enough room for d16. It is one
+  training seed: seed-to-seed spread at d12 is ~0.003 AUC and ~20% in 1/eB, so more seeds are in the run log.
+- **H1g was the design until 2026-10-03.** It meets all three limits, and it is bit-exact (max |Δ logit| = 0) between QONNX and
   HLS C-sim. Its float model scores 0.9731 (all 404k jets).
 - **H1r / H1f are the smaller fallback.** `--dsp-mult` moves 328 multiplies to DSPs for −5% LUT, with the same II,
   timing and AUC.
@@ -116,6 +120,46 @@ Two conversion details had to change:
   - `--clone-fanout` in `convert.py`; always on in `mini_parallel.py` io_parallel.
   - Registering the pool output (`LATENCY min=1`) did not help.
 
+## 3b. LUT knobs (2026-10-03)
+
+H1g's LUT (286k) split: multipliers 78k (27%), elementwise layers 107k (37%), DATAFLOW glue 100k (35%: FIFO control
+64k for ~2,900 scalar depth-2 FIFOs, mux 25k, expressions 11k). Two opt-in flags in `mini_parallel.py` and
+`convert.py` patch the generated project (csynth only; C-sim and outputs unchanged):
+
+- `--reshape-channels`: `ARRAY_RESHAPE` instead of `ARRAY_PARTITION` on the inter-layer arrays, so each layer
+  boundary is one channel, not one FIFO per element. Arrays a pointwise conv reads or writes stay partitioned: the
+  conv indexes them per PF partition, and on a reshaped word that costs ~400k LUT per conv (K1).
+- `--dsp-add`: `config_op add/sub -impl dsp`, with `--dsp-mult`. Moves adder trees and elementwise adds to DSPs.
+
+| run | knobs (d12 n16 m1 PF2 360 MHz) | LUT | DSP | latency |
+|---|---|---|---|---|
+| Q1 | none (random weights) | 274k (63%) | 0 | 100 cyc |
+| K0 | dsp-mult | 255k (59%) | 475 | 100 |
+| K1b | reshape-channels | 232k (53%) | 0 | 34 |
+| K3a | reshape + dsp-mult | 213k (49%) | 475 | 34 |
+| K2 | dsp-mult + dsp-add | 220k (51%) | 2300 (74%) | 100 |
+| K3b | all three | 178k (41%) | 2300 (74%) | 34 |
+| H1g graph | reshape | 247k (57%) | 0 | 34 |
+| H1g graph | all three | 194k (44%) | 2407 (78%) | 34 |
+
+II, clock estimate and bit-exactness are unchanged in every run. `--dsp-add` runs out of DSPs past ~d13
+(d16: 3694 DSP, d18: 4460), so the default set is `--reshape-channels --dsp-mult`.
+
+Frontier with that set (random weights; trained graphs land 4-5 pts higher, so the gate is 77%):
+
+| shape | II | LUT | | shape | II | LUT |
+|---|---|---|---|---|---|---|
+| d12 n16 | 8 | 49% | | d14 n20 (2.5 ns) | 10 | 71% |
+| d12 n16 r2 / h2 | 8 | 52% / 51% | | d16 n16 | 8 | 70% |
+| d12 n18 (2.77 ns) | 9 | 54% | | d16 n16 h2 / r2 | 8 | 75% / 76% |
+| d12 n20 (2.5 ns) | 10 | 58% | | d16 n18 (2.77 ns) | 9 | 77% |
+| d14 n16 | 8 | 59% | | d18 n16 | 8 | 81% (no) |
+| d14 n16 h2 / r2 | 8 | 62% / 64% | | d16 n20 (2.5 ns) | 10 | 84% (no) |
+| d12 n24 PF3 | 8 | 71% | | d20 n16 | 8 | 92% (no) |
+
+Trained graphs (all bit-exact, 404k-jet C-sim = NERSC `qat_deepsets_eval.py`): d16 n16 74% (AUC 0.9703),
+d12 n24 76% (0.9678), d14 n16 59% (0.9591, bad float seed), d12 n20 at 400 MHz 58% (0.9640), d12 h2 55% (0.9658).
+
 ## 4. Model knobs (random weights, d8 n16, PF 2, 360 MHz)
 
 | run | knob | LUT | vs L6b (263k) | keep? |
@@ -151,6 +195,9 @@ Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 - 9984 jets give AUC ±0.002 and 1/eB@0.5 ±20%. Rank with `csim_forward.py` on all 404k jets (README).
 
 ## 6. Next steps
+
+0. (2026-10-03) More seeds of d16 n16 and of the r2 shapes (run log RC/RD rows); pick the best seed on validation
+   loss. Check `--reshape-channels` in C/RTL co-simulation once, since it changes the channel structure.
 
 1. **Vivado synthesis and place-and-route of H1g** at 360 MHz with a pblock on one SLR. csynth estimates 2.03 ns
    against 2.78 ns, but routed timing at 66% LUT is the real question. The 200 MHz PF 4 build is the fallback.
