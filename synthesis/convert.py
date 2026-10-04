@@ -52,6 +52,8 @@ p.add_argument("--dsp-mult", action="store_true", help="bind all multiplies to D
 p.add_argument("--dsp-add", action="store_true", help="bind adds/subs to DSPs too (config_op add/sub -impl dsp)")
 p.add_argument("--reshape-channels", action="store_true",
                help="io_parallel: ARRAY_RESHAPE the inter-layer arrays (one DATAFLOW channel per array, not per element)")
+p.add_argument("--auto-rewind", action="store_true",
+               help="io_parallel C/RTL fix: no explicit conv rewind + input capture process (Vitis auto-rewinds every conv)")
 p.add_argument("--io-type", default="io_stream", choices=["io_stream", "io_parallel"])
 p.add_argument("--reuse-factor", type=int, default=1)
 p.add_argument("--strategy", default="Resource", choices=["Resource", "Latency"])
@@ -77,6 +79,8 @@ if args.dsp_add:
     OUT_DIR += "_dspadd"
 if args.reshape_channels:
     OUT_DIR += "_rsh"
+if args.auto_rewind:
+    OUT_DIR += "_arw"
 
 # hls4ml bug: Layer._validate_attributes wraps ApplyAlpha's scale/bias_precision in NamedType, and
 # ScaleDownAdd rebuilds ApplyAlpha from those attributes, which update_precision rejects. Unwrap it.
@@ -323,6 +327,31 @@ def clone_fanout(cpp, top):
     print(f"[clone] {n} fan-out arrays split in {cpp}")
 
 
+def auto_rewind(cpp, top):
+    """Copied from mini_parallel.py. io_parallel C/RTL fix (2026-10-03, run log D2-D8). hls4ml's explicit `rewind` on the pointwise-conv PartitionLoop
+    makes the RTL differ from C-sim (cosim: mini BIS-b 333 of 500 jets wrong; H1g, H2-d16s4 argmax 0.965). Without it,
+    Vitis auto-rewinds every conv that reads an internal channel (II unchanged, RTL exact), but not the first conv,
+    which reads the top-level port (II n_partitions + depth). So drop the rewind and give the input its own capture
+    process. Synthesis only: the arithmetic and C-sim are unchanged."""
+    h = os.path.join(os.path.dirname(cpp), "nnet_utils", "nnet_conv1d_latency.h")
+    s = open(h).read()
+    old = "#pragma HLS PIPELINE II=CONFIG_T::reuse_factor rewind"
+    assert s.count(old) == 1, h
+    open(h, "w").write(s.replace(old, "#pragma HLS PIPELINE II=CONFIG_T::reuse_factor"))
+    s = open(cpp).read()
+    size = re.search(r"input_t global_in\[([^\]]+)\]", s)[1]
+    first = re.search(r"\n(\s*nnet::\w+<[^\n]*>\()global_in,", s)
+    s = s.replace(first[0], f"\n{first[1]}global_in_cp,", 1)
+    k = s.index("// hls-fpga-machine-learning insert layers") + len("// hls-fpga-machine-learning insert layers")
+    s = s[:k] + (f"\n    input_t global_in_cp[{size}];\n    #pragma HLS ARRAY_PARTITION variable=global_in_cp complete dim=0\n"
+                 f"    ps_copy<input_t, {size}>(global_in, global_in_cp);\n") + s[k:]
+    j = s.index(f"void {top}(")
+    s = s[:j] + ("template <class T, int N> void ps_copy(T src[N], T dst[N]) {\n    #pragma HLS PIPELINE\n"
+                 "    for (int i = 0; i < N; i++) {\n        #pragma HLS UNROLL\n        dst[i] = src[i];\n    }\n}\n\n") + s[j:]
+    open(cpp, "w").write(s)
+    print(f"[auto-rewind] conv rewind dropped, input capture before {first[1].strip()}")
+
+
 def reshape_channels(cpp):
     """Copied from mini_parallel.py. io_parallel DATAFLOW: each element of a completely partitioned inter-layer array is its own channel (a depth-2
     FIFO), ~2,900 FIFOs and 64k LUT of FIFO control in H1g. ARRAY_RESHAPE packs each array into one wide word, so each
@@ -343,6 +372,8 @@ if args.clone_fanout:
     clone_fanout(f"{OUT_DIR}/firmware/deepsets.cpp", "deepsets")
 if args.reshape_channels:
     reshape_channels(f"{OUT_DIR}/firmware/deepsets.cpp")
+if args.auto_rewind:
+    auto_rewind(f"{OUT_DIR}/firmware/deepsets.cpp", "deepsets")
 if args.dsp_mult:  # synthesis-only, as mini_parallel.py --dsp-mult
     tcl, clk = f"{OUT_DIR}/build_prj.tcl", "create_clock -period $clock_period -name default"
     src = open(tcl).read()
