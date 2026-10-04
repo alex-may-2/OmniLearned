@@ -20,6 +20,9 @@ Fix, new flag `--auto-rewind` in both scripts (suffix `_arw`): drop the explicit
 capture process, so every conv reads an internal channel; Vitis then auto-rewinds every conv itself. II unchanged,
 C-sim unchanged, cosim exact (mini BIS-b and BIS-d on 500 jets, H2-d16s4 and H1g-rsh on 200 real jets), and 4-5%
 less LUT (H2-d16s4 318k to 300k). Use it on every io_parallel build. Run log rows CUT-*, VAR-*, D3-D8, FIX-*.
+It is not a complete fix: the d16 r2 floor build still differs (exact at 5 ns or with Vitis auto-rewind off, II 15;
+run log R2-*), and a rewind-free d18 (PF 4, auto-rewind off) needs II 11 = 30 ns. So every design gets a 200-jet
+cosim (local `helpers/h2.sh` does it); the current best H4-d18s4stk is exact on 2000 jets.
 
 **Caveat.** All hardware numbers are Vitis HLS 2024.1 csynth estimates. There is no Vivado place and route. Clocks of
 320 MHz and above are **csynth-only, not P&R-confirmed**.
@@ -208,8 +211,10 @@ Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 
 ## 6. Next steps
 
-0. (2026-10-03) The RTL/C mismatch is fixed by `--auto-rewind` (above). Quantization scan: floor rounding (`--round
-   floor`) frees ~10% LUT at no AUC cost; d18 and d16 r2 with floor are in training (run log QZ*, QP*, QF*).
+0. (2026-10-04) Current best **H4-d18s4stk**: d18p2r1m1 n16, QAT `--round floor --bits 9 --in-bits 12 --tanh-in-max 2`,
+   PF2 360 MHz with `--auto-rewind`: 69% LUT, 36% DSP, II 22.2 ns, AUC 0.9748, 1/eB@0.5 130.8, cosim exact. Floor
+   rounding frees ~10% LUT at no AUC cost; 9 bits, 12-bit input and tanh range 2 add ~+0.002 AUC (run log QZ1-QZ4).
+   Next: Vivado P&R of H4; root cause of the remaining auto-rewind failure (d16 r2 floor build).
 
 1. **Vivado synthesis and place-and-route of H1g** at 360 MHz with a pblock on one SLR. csynth estimates 2.03 ns
    against 2.78 ns, but routed timing at 66% LUT is the real question. The 200 MHz PF 4 build is the fallback.
