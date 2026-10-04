@@ -48,6 +48,7 @@ from hls4ml.model.types import FixedPrecisionType, NamedType, TensorVariable, We
 from onnx import TensorProto, helper, numpy_helper
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.core.onnx_exec import execute_onnx
+from qonnx.transformation.infer_shapes import InferShapes
 from qonnx.util.cleanup import cleanup_model
 
 PART = "xcvu13p-flga2577-2-e"
@@ -71,6 +72,14 @@ p.add_argument("--pf", type=int, default=None, help="ParallelizationFactor of th
 p.add_argument("--res-bits", type=int, default=10, help="--distillnet: bits of the r7 residual-stream/pool Quants (0: none)")
 p.add_argument("--relu-uint", action=argparse.BooleanOptionalAction, default=True, help="--distillnet: r7 unsigned block-ReLU Quants")
 p.add_argument("--no-embed-dyt", action="store_true", help="--distillnet: embed ReLU -> unsigned Quant, no DyT")
+p.add_argument("--cut", default=None,
+               help="debug: end the graph at this ONNX tensor (e.g. Quant_3_out) for C/RTL cosim bisection")
+p.add_argument("--w-bits", type=int, default=8, help="--distillnet: weight bits")
+p.add_argument("--a-bits", type=int, default=8, help="--distillnet: activation bits (Linear inputs; 8-bit ranges kept)")
+p.add_argument("--in-bits", type=int, default=None, help="--distillnet: input Quant bits, range +-4 (default --a-bits)")
+p.add_argument("--tanh-bits", type=int, default=None, help="--distillnet: tanh input bits (default --a-bits)")
+p.add_argument("--tanh-in-max", type=float, default=4.0, help="--distillnet: tanh input range [-x, x)")
+p.add_argument("--round", choices=["round", "floor"], default="round", help="activation Quant rounding (weights: round)")
 p.add_argument("--io-type", default="io_parallel", choices=["io_parallel", "io_stream"])
 p.add_argument("--clock", type=float, default=5.0, help="target clock period in ns")
 p.add_argument("--rf", type=int, default=1, help="ReuseFactor of the per-particle layers")
@@ -84,6 +93,11 @@ p.add_argument("--pipeline-ii", type=int, default=None, help="with --pipeline-st
 p.add_argument("--strategy", choices=["Latency", "Resource"], default=None, help="default: Resource for io_stream, else Latency")
 p.add_argument("--synth", action="store_true")
 args = p.parse_args()
+args.in_bits, args.tanh_bits = args.in_bits or args.a_bits, args.tanh_bits or args.a_bits
+A = 2.0 ** (8 - args.a_bits)  # a-bit activations keep the 8-bit ranges
+ACT_SCALE, TANH_OUT_SCALE = ACT_SCALE * A, TANH_OUT_SCALE * A
+TANH_IN_SCALE = args.tanh_in_max / 2 ** (args.tanh_bits - 1)
+ROUNDING = args.round.upper()
 fq = args.full_quant or args.distillnet
 phi = [int(d) for d in args.phi.split(",")]
 rho = [int(d) for d in args.rho.split(",")] if args.rho else []
@@ -93,6 +107,9 @@ if args.distillnet:
     OUT_DIR = f"hls_prj/mini_ds_d{args.dim}r{args.ratio}_phi{args.phi_blocks}_rho{args.rho_blocks}_n{args.n}_pf{pf}"
     OUT_DIR += f"_q{args.res_bits}{'u' if args.relu_uint else ''}{'_noembdyt' if args.no_embed_dyt else ''}"
     OUT_DIR += f"_h{args.rho_ratio}" if args.rho_ratio and args.rho_ratio != args.ratio else ""
+    qs = [("w", args.w_bits, 8), ("a", args.a_bits, 8), ("i", args.in_bits, args.a_bits), ("t", args.tanh_bits, args.a_bits)]
+    qs = "".join(f"{k}{v:g}" for k, v, d in qs + [("tm", args.tanh_in_max, 4)] if v != d)
+    OUT_DIR += (f"_{qs}" if qs else "") + ("_fl" if args.round == "floor" else "")
 else:
     OUT_DIR = f"hls_prj/mini{'_fq' if fq else ''}_n{args.n}_phi{'-'.join(map(str, phi))}_rho{'-'.join(map(str, rho))}_pf{pf}"
 levers = [(f"rf{args.rf}", args.rf > 1), ("mlf", args.mult_limit_fix), ("dsp", args.dsp_mult)]
@@ -101,6 +118,7 @@ levers += [(str(args.pipeline_style), args.pipeline_style), ("stream", stream), 
 levers += [(f"ii{args.pipeline_ii}", args.pipeline_ii)]
 levers += [(str(args.strategy).lower(), args.strategy and args.strategy != ("Resource" if stream else "Latency"))]
 OUT_DIR += "".join(f"_{tag}" for tag, on in levers if on)
+OUT_DIR += f"_cut{args.cut}" if args.cut else ""
 
 # --- hls4ml patches copied from convert.py (see the comments there) ---
 _update_precision = WeightVariable.update_precision
@@ -203,19 +221,19 @@ def count(op):
     return sum(n.op_type == op for n in nodes)
 
 
-def quant(x, scale, signed, narrow=0, bits=8):
+def quant(x, scale, signed, narrow=0, bits=None, rounding=None):
     i = count("Quant")
     out = f"Quant_{i}_out"
     nodes.append(
         helper.make_node(
             "Quant",
-            [x, const(f"Quant_{i}_s", scale), const(f"Quant_{i}_z", 0.0), const(f"Quant_{i}_b", float(bits))],
+            [x, const(f"Quant_{i}_s", scale), const(f"Quant_{i}_z", 0.0), const(f"Quant_{i}_b", float(bits or args.a_bits))],
             [out],
             name=f"Quant_{i}",
             domain="qonnx.custom_op.general",
             signed=signed,
             narrow=narrow,
-            rounding_mode="ROUND",
+            rounding_mode=rounding or ROUNDING,
         )
     )
     return out
@@ -225,13 +243,13 @@ def matmul(x, d_in, d_out, out=None, in_scale=None):
     """MatMul with an 8-bit weight Quant; with in_scale (full-quant) also an Int16 bias on the accumulator grid."""
     i = count("MatMul")
     w = rng.normal(0, 1 / np.sqrt(d_in), (d_in, d_out))
-    w_scale = 2.0 ** np.ceil(np.log2(np.abs(w).max() / 127))
+    w_scale = 2.0 ** np.ceil(np.log2(np.abs(w).max() / (2 ** (args.w_bits - 1) - 1)))
     macs.append(d_in * d_out)
     mm_out = f"MatMul_{i}_out" if in_scale else out or f"MatMul_{i}_out"
-    nodes.append(helper.make_node("MatMul", [x, quant(const(f"W_{i}", w), w_scale, 1, narrow=1)], [mm_out], name=f"MatMul_{i}"))
+    nodes.append(helper.make_node("MatMul", [x, quant(const(f"W_{i}", w), w_scale, 1, narrow=1, bits=args.w_bits, rounding="ROUND")], [mm_out], name=f"MatMul_{i}"))
     if not in_scale:
         return mm_out
-    b = quant(const(f"B_{i}", rng.normal(0, 0.1, d_out)), in_scale * w_scale, 1, bits=16)
+    b = quant(const(f"B_{i}", rng.normal(0, 0.1, d_out)), in_scale * w_scale, 1, bits=16, rounding="ROUND")
     out = out or f"Bias_{i}_out"
     nodes.append(helper.make_node("Add", [mm_out, b], [out], name=f"Bias_{i}"))
     return out
@@ -249,7 +267,7 @@ def dyt(x, alpha):
         i = count("Mul")
         nodes.append(helper.make_node("Mul", [x, const(f"alpha_{i}", alpha)], [f"Mul_{i}_out"], name=f"Mul_{i}"))
         x = f"Mul_{i}_out"
-    t = quant(x, TANH_IN_SCALE, 1)
+    t = quant(x, TANH_IN_SCALE, 1, bits=args.tanh_bits)
     j = count("Tanh")
     nodes.append(helper.make_node("Tanh", [t], [f"Tanh_{j}_out"], name=f"Tanh_{j}"))
     return quant(f"Tanh_{j}_out", TANH_OUT_SCALE, 1)
@@ -286,8 +304,8 @@ def residual(h, d, hidden, alpha, relu_scale=ACT_SCALE):
     return f"Res_{i}_out"
 
 
-IN_SCALE = 2.0**-5 if args.distillnet else ACT_SCALE  # r7 input Quant: 8-bit, 1/32
-x = quant("global_in", IN_SCALE, 1)
+IN_SCALE = 4 / 2 ** (args.in_bits - 1) if args.distillnet else ACT_SCALE  # r7 input Quant: 8-bit, 1/32 (+-4)
+x = quant("global_in", IN_SCALE, 1, bits=args.in_bits if args.distillnet else None)
 if args.distillnet:
     d, hidden = args.dim, args.ratio * args.dim
     # Scales and po2 alphas from the r7 graph: embed alpha 1, residual-stream norms 8; block ReLU Quants 1/64 (phi)
@@ -299,11 +317,11 @@ if args.distillnet:
         x = matmul(dyt(t, 1.0), hidden, d, in_scale=TANH_OUT_SCALE)
     x = res_quant(x, 2.0**-7)
     for _ in range(args.phi_blocks):
-        x = res_quant(residual(x, d, hidden, 8.0, 2.0**-6), 2.0**-6)
+        x = res_quant(residual(x, d, hidden, 8.0, A * 2.0**-6), 2.0**-6)
     n_pp = count("MatMul")
     x = res_quant(pool(x), 2.0**-9)
     for _ in range(args.rho_blocks):
-        x = residual(x, d, (args.rho_ratio or args.ratio) * d, 8.0, 2.0**-7)
+        x = residual(x, d, (args.rho_ratio or args.ratio) * d, 8.0, A * 2.0**-7)
     out_scale = TANH_OUT_SCALE if args.res_bits else ACT_SCALE  # r7: 8-bit 1/128 before the output Linear
     matmul(quant(x, out_scale, 1), d, 2, out="logits", in_scale=out_scale)
 else:
@@ -319,13 +337,20 @@ else:
         x, s, d = (dyt(relu(x), 2.0), TANH_OUT_SCALE, d_out) if fq else (quant(relu(x), ACT_SCALE, 0), s, d_out)
     matmul(x, d, 2, out="logits", in_scale=s if fq else None)
 
-graph = helper.make_graph(
-    nodes,
-    "mini_deepsets",
-    [helper.make_tensor_value_info("global_in", TensorProto.FLOAT, [BATCH, args.n, 4])],
-    [helper.make_tensor_value_info("logits", TensorProto.FLOAT, [BATCH, 2])],
-    inits,
-)
+in_vi = helper.make_tensor_value_info("global_in", TensorProto.FLOAT, [BATCH, args.n, 4])
+out_vi = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [BATCH, 2])
+if args.cut:  # keep only the nodes the cut tensor needs; its shape from one execution of the full graph
+    full = ModelWrapper(helper.make_model(helper.make_graph(nodes, "full", [in_vi], [out_vi], inits),
+                                          opset_imports=[helper.make_opsetid("", 13)], ir_version=9)).transform(InferShapes())
+    shape = execute_onnx(full, {"global_in": np.zeros((BATCH, args.n, 4), np.float32)}, True)[args.cut].shape
+    need, keep = {args.cut}, []
+    for nd in reversed(nodes):
+        if set(nd.output) & need:
+            keep.insert(0, nd)
+            need |= set(nd.input)
+    nodes[:], inits[:] = keep, [t for t in inits if t.name in need]
+    out_vi = helper.make_tensor_value_info(args.cut, TensorProto.FLOAT, list(shape))
+graph = helper.make_graph(nodes, "mini_deepsets", [in_vi], [out_vi], inits)
 os.makedirs(OUT_DIR, exist_ok=True)
 onnx_path = f"{OUT_DIR}/model.onnx"
 onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=9), onnx_path)
@@ -342,10 +367,13 @@ if args.pipeline_ii:
 for layer_cfg in cfg["LayerName"].values():
     layer_cfg["Strategy"] = strategy
 for i in range(n_pp):  # set on MatMul_<i>: MatmulConstToDense copies it onto the Dense_MatMul_<i> PointwiseConv1D
+    if f"MatMul_{i}" not in cfg["LayerName"]:  # --cut before it
+        continue
     if not stream:
         cfg["LayerName"][f"MatMul_{i}"]["ParallelizationFactor"] = pf
     cfg["LayerName"][f"MatMul_{i}"]["ReuseFactor"] = args.rf
-cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = "fixed<32,16>"  # sum of n 8-bit values
+if "GlobalAveragePool_0" in cfg["LayerName"]:  # not with --cut before the pool
+    cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["accum"] = "fixed<32,16>"  # sum of n 8-bit values
 
 
 def quant_type(node):
@@ -353,7 +381,8 @@ def quant_type(node):
     scale = model.get_initializer(node.input[1]).item()
     bits = int(model.get_initializer(node.input[3]).item())
     signed = next((a.i for a in node.attribute if a.name == "signed"), 1)
-    return f"{'' if signed else 'u'}fixed<{bits},{bits + int(np.log2(scale))},RND_CONV,SAT>"
+    rnd = "TRN" if next((a.s for a in node.attribute if a.name == "rounding_mode"), b"ROUND") == b"FLOOR" else "RND_CONV"
+    return f"{'' if signed else 'u'}fixed<{bits},{bits + int(np.log2(scale))},{rnd},SAT>"
 
 
 def is_quant(node):
@@ -381,7 +410,7 @@ if fq:  # exact types, as convert.py sets them for the full-quant graph
         cfg["LayerName"][t.name]["Precision"]["result"] = quant_type(post)
     cfg["LayerName"]["global_in"]["Precision"]["result"] = quant_type(model.find_consumer("global_in"))
     first = convert(copy.deepcopy(cfg)).graph
-    pool_in = first["GlobalAveragePool_0"].get_input_variable().type.precision
+    pool_in = first["GlobalAveragePool_0"].get_input_variable().type.precision if "GlobalAveragePool_0" in first else None
     k = int(np.ceil(np.log2(args.n)))  # exact /n for power-of-2 n
     # Other n: the pool truncates sum / n in accum_t, and the true mean is never closer than 1 / (n * 2^10) to a
     # rounding tie of the 10-bit pool Quant, so >= log2(n) + 11 fractional bits keep it exact (6 more than 2k).
@@ -392,13 +421,14 @@ if fq:  # exact types, as convert.py sets them for the full-quant graph
         cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = f"fixed<{w + k},{i}>"
     # r7 pool -> Flatten -> Quant: round in the pool itself (exact for power-of-2 n). As a separate zero-latency
     # Quant it chains with the next alpha + Quant in one cycle (2.98 + 2.82 ns) and misses 5 ns in io_parallel.
-    gap = model.get_nodes_by_op_type("GlobalAveragePool")[0]
-    q = model.find_consumer(model.find_consumer(gap.output[0]).output[0])
-    if is_quant(q):
-        cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = quant_type(q)
+    for gap in model.get_nodes_by_op_type("GlobalAveragePool"):
+        q = model.find_consumer(model.find_consumer(gap.output[0]).output[0])
+        if is_quant(q):
+            cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = quant_type(q)
     for r in model.get_nodes_by_op_type("Relu"):
         layer = first.get(r.name)
-        if layer is not None and layer.get_output_variable().type.precision.rounding_mode.name == "TRN":
+        fused = is_quant(model.find_consumer(r.output[0]))  # a FLOOR Quant fused into the ReLU is TRN too
+        if layer is not None and not fused and layer.get_output_variable().type.precision.rounding_mode.name == "TRN":
             in_t = layer.get_input_variable().type.precision
             if isinstance(in_t, FixedPrecisionType):
                 cfg["LayerName"][r.name]["Precision"]["result"] = f"fixed<{in_t.width},{in_t.integer}>"
@@ -493,7 +523,7 @@ if args.dsp_add:
     patch(f"{OUT_DIR}/build_prj.tcl", clk, clk + "\nconfig_op add -impl dsp\nconfig_op sub -impl dsp")
 
 # --- C-sim parity vs qonnx on random inputs (inputs on the 8-bit grid) ---
-xin = (np.round(rng.normal(0, 2, (BATCH, args.n, 4)) / IN_SCALE) * IN_SCALE).clip(-128 * IN_SCALE, 127 * IN_SCALE).astype(np.float32)
+xin = (np.round(rng.normal(0, 2, (BATCH, args.n, 4)) / IN_SCALE) * IN_SCALE).clip(-(2 ** (args.in_bits - 1)) * IN_SCALE, (2 ** (args.in_bits - 1) - 1) * IN_SCALE).astype(np.float32)
 ref = execute_onnx(model, {"global_in": xin})[model.graph.output[0].name]
 hls = np.asarray(hls_model.predict(np.ascontiguousarray(xin))).reshape(ref.shape)
 print(f"[random] max|dlogit|={np.abs(ref - hls).max():.4g} argmax agree={np.mean(ref.argmax(1) == hls.argmax(1)):.3f}")

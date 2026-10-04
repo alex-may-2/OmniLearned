@@ -194,7 +194,8 @@ def quant_type(node):
     scale = model.get_initializer(node.input[1]).item()
     bits = int(model.get_initializer(node.input[3]).item())
     signed = next((a.i for a in node.attribute if a.name == "signed"), 1)
-    return f"{'' if signed else 'u'}fixed<{bits},{bits + int(np.log2(scale))},RND_CONV,SAT>"
+    rnd = "TRN" if next((a.s for a in node.attribute if a.name == "rounding_mode"), b"ROUND") == b"FLOOR" else "RND_CONV"
+    return f"{'' if signed else 'u'}fixed<{bits},{bits + int(np.log2(scale))},{rnd},SAT>"
 
 
 def is_quant(node):
@@ -269,7 +270,8 @@ if args.io_type == "io_parallel" and is_quant(pool_q):
     cfg["LayerName"]["GlobalAveragePool_0"]["Precision"]["result"] = quant_type(pool_q)
 for relu in model.get_nodes_by_op_type("Relu"):
     layer = first.get(relu.name)
-    if layer is not None and layer.get_output_variable().type.precision.rounding_mode.name == "TRN":
+    fused = is_quant(model.find_consumer(relu.output[0]))  # a FLOOR Quant fused into the ReLU is TRN too
+    if layer is not None and not fused and layer.get_output_variable().type.precision.rounding_mode.name == "TRN":
         in_t = layer.get_input_variable().type.precision
         if isinstance(in_t, FixedPrecisionType):
             cfg["LayerName"][relu.name]["Precision"]["result"] = f"fixed<{in_t.width},{in_t.integer}>"
