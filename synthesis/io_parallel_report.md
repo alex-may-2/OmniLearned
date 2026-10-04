@@ -9,14 +9,17 @@ Run log, one row per run (history, including abandoned multi-copy builds): `synt
 
 II, the one-SLR fit and the clock are hard limits. AUC is soft (reference 0.9644 = r7 − 0.01 on the 9984-jet subset).
 
-**Open issue (2026-10-03): io_parallel RTL differs from C-sim.** C/RTL co-simulation of H1g (as built on
-2026-10-01), H1g + `--reshape-channels` and H2-d16s4 gives RTL logits that differ from the C testbench on the same
-jets (max |d logit| ~3, argmax agreement 0.965 on 200 jets); C-sim itself matches QONNX bit for bit. The r7
-io_stream project is exact in cosim (50 jets), and an input-capture process in front of the first conv does not
-change the H1g result. Mini-graph bisection (d8 n16, random weights): embed only is almost exact (1 of 100 rows off
-by ~1 output LSB); adding the embed DyT/tanh block breaks most rows. The tanh ROM contents are correct. The cause is
-still open, so AUCs here are C-sim (= QONNX) numbers, not yet confirmed on RTL. Repro: `/tmp/alexmay_ps/cosim.sh`
-(rows COSIM-* and BIS-* in the run log).
+**C/RTL mismatch: found and fixed (2026-10-03).** C/RTL co-simulation of every io_parallel build (H1g, H2-d16s4) gave
+RTL logits that differ from C-sim (max |d logit| ~3, argmax agreement 0.965 on 200 jets); C-sim matches QONNX bit for
+bit and the r7 io_stream build was exact. Cause: the explicit `rewind` that hls4ml puts on the pointwise-conv
+`PartitionLoop` (`nnet_conv1d_latency.h`, `PIPELINE II=RF rewind`). Cut graphs (`mini_parallel.py --cut`) showed the
+first wrong layer is a conv output; without the rewind the RTL is exact but the first conv (the one reading the
+top-level port) is not rewound and its II becomes n_partitions + depth (13 cycles). Pipeline styles, deeper FIFOs,
+`ap_ctrl_chain`, start propagation, ping-pong channels and loop-local buffers all left the identical wrong values.
+Fix, new flag `--auto-rewind` in both scripts (suffix `_arw`): drop the explicit rewind and give the input its own
+capture process, so every conv reads an internal channel; Vitis then auto-rewinds every conv itself. II unchanged,
+C-sim unchanged, cosim exact (mini BIS-b and BIS-d on 500 jets, H2-d16s4 and H1g-rsh on 200 real jets), and 4-5%
+less LUT (H2-d16s4 318k to 300k). Use it on every io_parallel build. Run log rows CUT-*, VAR-*, D3-D8, FIX-*.
 
 **Caveat.** All hardware numbers are Vitis HLS 2024.1 csynth estimates. There is no Vivado place and route. Clocks of
 320 MHz and above are **csynth-only, not P&R-confirmed**.
@@ -205,8 +208,8 @@ Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 
 ## 6. Next steps
 
-0. (2026-10-03) **Find the io_parallel RTL/C mismatch** (see the open issue above): cut the mini graph after the
-   DyT block (normalize, tanh) and co-simulate each layer output. Then more d16 / d14 r2 seeds, best on validation.
+0. (2026-10-03) The RTL/C mismatch is fixed by `--auto-rewind` (above). Quantization scan: floor rounding (`--round
+   floor`) frees ~10% LUT at no AUC cost; d18 and d16 r2 with floor are in training (run log QZ*, QP*, QF*).
 
 1. **Vivado synthesis and place-and-route of H1g** at 360 MHz with a pblock on one SLR. csynth estimates 2.03 ns
    against 2.78 ns, but routed timing at 66% LUT is the real question. The 200 MHz PF 4 build is the fallback.
