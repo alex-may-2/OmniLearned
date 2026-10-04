@@ -129,6 +129,14 @@ def fold_dyt_gamma(model):
         a.copy_(a_po2)
 
 
+def floor_round(quant):
+    """The Brevitas quantizer with floor instead of round-half-even (QONNX rounding_mode FLOOR, hls4ml AP_TRN: no
+    rounding adder or tie logic in the requant)."""
+    from brevitas.inject.enum import FloatToIntImplType
+
+    return quant.let(float_to_int_impl_type=FloatToIntImplType.FLOOR)
+
+
 class QuantDynamicTanh(nn.Module):
     """hls4ml-exact DynamicTanh: tanh(Quant8(alpha_po2 * x)), no gamma.
 
@@ -137,18 +145,18 @@ class QuantDynamicTanh(nn.Module):
     with one entry per code (TableSize = 8 / scale) is exact; the tanh output
     goes straight into the next QuantLinear's input quantizer."""
 
-    def __init__(self, alpha, act_bits, in_max=0.0):
+    def __init__(self, alpha, act_bits, in_max=0.0, floor=False):
         super().__init__()
         import brevitas.nn as qnn
         from brevitas.inject.enum import ScalingImplType
         from brevitas.quant import Int8ActPerTensorFixedPoint
 
-        quant = Int8ActPerTensorFixedPoint
+        quant = floor_round(Int8ActPerTensorFixedPoint) if floor else Int8ActPerTensorFixedPoint
         if in_max:
             # Fixed input range [-in_max, in_max) instead of a learned one. in_max = 4 matches the hls4ml tanh
             # table span: 8-bit tanh(4) already rounds to the top output code, so clipping there costs nothing,
             # and the resolution is 1/32 where a learned range can drift to 1/4.
-            quant = Int8ActPerTensorFixedPoint.let(scaling_impl_type=ScalingImplType.CONST, min_val=-in_max, max_val=in_max)
+            quant = quant.let(scaling_impl_type=ScalingImplType.CONST, min_val=-in_max, max_val=in_max)
 
         self.alpha = nn.Parameter(alpha.detach().clone())
         self.act_quant = qnn.QuantIdentity(act_quant=quant, bit_width=act_bits, return_quant_tensor=False)
@@ -160,7 +168,7 @@ class QuantDynamicTanh(nn.Module):
         return torch.tanh(self.act_quant(alpha * x))
 
 
-def quant_residual_stream(model, res_bits):
+def quant_residual_stream(model, res_bits, floor=False):
     """Quantize the fixed-N DeepSets residual stream: the embed output, every phi residual sum (the last one is the
     pool input) and the pool output, each with a power-of-2 QuantIdentity. Otherwise hls4ml carries these sums at
     full accumulator width (25-bit per particle, a 37-bit pool accumulator). Adds body.res_quant and replaces the
@@ -172,8 +180,9 @@ def quant_residual_stream(model, res_bits):
 
     body = model.body
     assert body.fixed_n and not body.pid and not body.add_info and not body.conditional, "fixed-N plain body only"
+    act_quant = floor_round(Int8ActPerTensorFixedPoint) if floor else Int8ActPerTensorFixedPoint
     body.res_quant = nn.ModuleList(  # embed out, each phi sum, pool out
-        qnn.QuantIdentity(act_quant=Int8ActPerTensorFixedPoint, bit_width=res_bits, return_quant_tensor=False)
+        qnn.QuantIdentity(act_quant=act_quant, bit_width=res_bits, return_quant_tensor=False)
         for _ in range(len(body.phi_blocks) + 2)
     )
 
@@ -217,12 +226,15 @@ def load_qat_model(checkpoint_dir, tag):
     model = build_deepsets(cfg)
     # Keys missing from older full-quant checkpoints (r1-r4) mean the option was off.
     wrap_linears_qat(model, q["weight_bits"], tanh_in_max=q.get("tanh_in_max") or 0.0,
-                     res_bits=q.get("res_bits") or 0, relu_uint=bool(q.get("relu_uint")))
+                     res_bits=q.get("res_bits") or 0, relu_uint=bool(q.get("relu_uint")),
+                     a_bits=q.get("act_bits"), in_bits=q.get("in_bits"), tanh_bits=q.get("tanh_bits"),
+                     floor=q.get("round") == "floor")
     restore_checkpoint(model, checkpoint_dir, get_checkpoint_name(tag), 0, is_main_node=True)
     return model, cfg
 
 
-def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True):
+def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True,
+                     a_bits=None, in_bits=None, tanh_bits=None, floor=False):
     """Replace every nn.Linear in `model` with a Brevitas QuantLinear in
     place, copying over the existing (already-trained) weight/bias so this
     is a warm start, not a random re-init. Submodule names/paths are
@@ -239,7 +251,10 @@ def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True):
 
     tanh_in_max: fixed tanh-input range [-x, x); 0 = learned.
     res_bits: also quantize the residual stream and pool (quant_residual_stream); 0 = off.
-    relu_uint: unsigned input quantizer for a Linear fed directly by a ReLU (MLP.fc2), one more bit of resolution."""
+    relu_uint: unsigned input quantizer for a Linear fed directly by a ReLU (MLP.fc2), one more bit of resolution.
+    bits sets the weights; a_bits (default bits) the Linear inputs, in_bits (default a_bits) the network input (the
+    embed fc1 input), tanh_bits (default a_bits) the tanh inputs. floor: activation quantizers round down (weights
+    keep round-half-even; they are constants)."""
     import brevitas.nn as qnn
     # Power-of-2 scales: in firmware each scale is a bit shift, not a multiplier.
     from brevitas.quant import (
@@ -249,13 +264,15 @@ def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True):
         Uint8ActPerTensorFixedPoint,
     )
 
+    a_bits = a_bits or bits
+    in_bits, tanh_bits = in_bits or a_bits, tanh_bits or a_bits
     if res_bits:
-        quant_residual_stream(model, res_bits)
+        quant_residual_stream(model, res_bits, floor)
 
     for module in list(model.modules()):
         for child_name, child in module.named_children():
             if isinstance(child, DynamicTanh):
-                setattr(module, child_name, QuantDynamicTanh(child.alpha, bits, tanh_in_max))
+                setattr(module, child_name, QuantDynamicTanh(child.alpha, tanh_bits, tanh_in_max, floor))
 
     targets = []
     for module in model.modules():
@@ -267,14 +284,15 @@ def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True):
         # MLP: fc1 -> act -> norm -> fc2; fc2 sees the ReLU output only when norm is Identity (not the embed MLP)
         after_relu = (relu_uint and child_name == "fc2" and isinstance(getattr(module, "act", None), nn.ReLU)
                       and isinstance(getattr(module, "norm", None), nn.Identity))
+        input_quant = Uint8ActPerTensorFixedPoint if after_relu else Int8ActPerTensorFixedPoint
         qlin = qnn.QuantLinear(
             child.in_features,
             child.out_features,
             bias=child.bias is not None,
             weight_quant=Int8WeightPerTensorFixedPoint,
             weight_bit_width=bits,
-            input_quant=Uint8ActPerTensorFixedPoint if after_relu else Int8ActPerTensorFixedPoint,
-            input_bit_width=bits,
+            input_quant=floor_round(input_quant) if floor else input_quant,
+            input_bit_width=in_bits if child is model.body.embed.fc1 else a_bits,
             bias_quant=Int16Bias,
             return_quant_tensor=False,
         )
@@ -292,7 +310,13 @@ def main():
     ap.add_argument("--save-tag", required=True, help="tag of the QAT checkpoint written to <output-dir>")
     ap.add_argument("--init-dir", default=CHECKPOINT_DIR, help="dir holding the float --tag checkpoint")
     ap.add_argument("--output-dir", default=CHECKPOINT_DIR, help="dir the QAT checkpoint is written to")
-    ap.add_argument("--bits", type=int, default=8)
+    ap.add_argument("--bits", type=int, default=8, help="all bit widths below default to this")
+    ap.add_argument("--w-bits", type=int, default=None, help="weights (default --bits)")
+    ap.add_argument("--a-bits", type=int, default=None, help="Linear inputs (default --bits)")
+    ap.add_argument("--in-bits", type=int, default=None, help="network input = embed fc1 input (default --a-bits)")
+    ap.add_argument("--tanh-bits", type=int, default=None, help="DyT tanh inputs (default --a-bits)")
+    ap.add_argument("--round", choices=["round", "floor"], default="round",
+                    help="activation quantizer rounding: round-half-even (hls4ml RND_CONV) or floor (TRN)")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--warmup-epoch", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=5e-5)
@@ -335,7 +359,10 @@ def main():
               f"fixed_n={shape['fixed_n']}): {n_params:,} params")
 
     fold_dyt_gamma(model)
-    wrap_linears_qat(model, args.bits, tanh_in_max=args.tanh_in_max, res_bits=args.res_bits, relu_uint=args.relu_uint)
+    w_bits, a_bits = args.w_bits or args.bits, args.a_bits or args.bits
+    in_bits, tanh_bits = args.in_bits or a_bits, args.tanh_bits or a_bits
+    wrap_linears_qat(model, w_bits, tanh_in_max=args.tanh_in_max, res_bits=args.res_bits, relu_uint=args.relu_uint,
+                     a_bits=a_bits, in_bits=in_bits, tanh_bits=tanh_bits, floor=args.round == "floor")
     # Saved into the checkpoint so the exact quantized network can be rebuilt for
     # FPGA conversion. Quantizer types and bit widths are read back from the
     # wrapped layers, so the record always matches what was trained.
@@ -359,7 +386,10 @@ def main():
             "weight_quant": qlin.weight_quant.quant_injector.__name__,
             "act_quant": qlin.input_quant.quant_injector.__name__,
             "weight_bits": int(qlin.weight_quant.bit_width()),
-            "act_bits": int(qlin.input_quant.bit_width()),
+            "act_bits": a_bits,  # Linear inputs; qlin is embed fc1, whose input has in_bits
+            "in_bits": int(qlin.input_quant.bit_width()),
+            "tanh_bits": tanh_bits,
+            "round": args.round,  # activation quantizers; weights always round-half-even
             "full_quant": True,  # Int16Bias biases + QuantDynamicTanh (gamma folded, po2 alpha)
             "tanh_in_max": args.tanh_in_max,  # 0 = learned tanh-input range
             "res_bits": args.res_bits,  # residual stream + pool QuantIdentity bits (0 = off)
@@ -368,7 +398,8 @@ def main():
     }
     if is_master_node():
         n_qlin = sum(1 for m in model.modules() if type(m).__name__ == "QuantLinear")
-        print(f"Wrapped {n_qlin} nn.Linear layers as Brevitas QuantLinear ({args.bits}-bit)")
+        print(f"Wrapped {n_qlin} nn.Linear layers as Brevitas QuantLinear (w{w_bits} a{a_bits} in{in_bits} "
+              f"tanh{tanh_bits} res{args.res_bits} {args.round})")
 
     train_loader = load_data(
         "top", dataset_type="train", use_cond=True, path=args.data_path, batch=args.batch,
