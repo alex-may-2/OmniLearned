@@ -334,6 +334,7 @@ hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quan
 | twamorka `distill_top_deepsets_distillnet_fpga_a05_T4` (d32p2r1, float) | 64 | float | 0.9253 | 0.9786 | 706 | 190 | 58.6 |
 | first QAT graph `_8bit` (same model, weights + Linear inputs only) | 64 | HLS | 0.9165 | 0.9756 | 523 | 143 | 46.3 |
 | r7 (same model, full-quant QAT) | 64 | HLS | 0.9205 | 0.9757 | 540 | 143 | 47.7 |
+| twamorka `qat_..._fpga_a05_T4_8bit_fullQuant` 2026-10-06 checkpoint (same model, full-quant; io_stream: II 340 ns, 66% LUT, 813 DSP, run log S-tw_d32fq_n64_stream) | 64 | HLS | 0.9213 | 0.9763 | 575 | 160 | 50.2 |
 | d12p2r1m1 float KD (`ps_d12p2r1m1_n16_e50`) | 16 | float | - | 0.9731 | 377 | 119 | 43.4 |
 | **H4-d18s4stk** d18p2r1m1, QAT floor + 9-bit + 12-bit input + tanh ±2 (current design) | 16 | HLS | 0.9191 | **0.9748** | 404 | 130.8 | 46.3 |
 | H4-d18r2s2stk d18p2r2m1, same QAT recipe | 16 | HLS | 0.9185 | 0.9745 | 388 | 125.3 | 45.7 |
