@@ -6,7 +6,12 @@ Notes for the agent or person running the FPGA step.
 - `convert.py` C-sim runs on Perlmutter or on SLAC rdsrv409.
 - Vitis HLS synthesis runs only on rdsrv409.
 
-**Single-SLR design (one jet every 25 ns, one SLR):** `io_parallel_report.md`. Current design: H1g, d12p2r1m1 n16 (mlp_ratio 1), io_parallel PF 2 at 360 MHz: II 22.2 ns, 66% of one SLR's LUT, HLS AUC 0.9697 on all 404k test jets. Run log: `parallel_search_log.md`. Flags: `convert.py --name --clock --mult-limit-fix --clone-fanout`.
+**Single-SLR design (one jet every 25 ns, one SLR):** `io_parallel_report.md`. Current design (2026-10-04):
+**H4-d18s4stk**, d18p2r1m1 n16 (mlp_ratio 1), QAT `--round floor --bits 9 --in-bits 12 --tanh-in-max 2`, io_parallel
+PF 2 at 360 MHz: II 22.2 ns, 69% of one SLR's LUT, 36% DSP, HLS AUC 0.9748 on all 404k test jets, C/RTL cosim exact
+(2000 jets). Run log: `parallel_search_log.md`. Build flags: `convert.py --name <stem> --io-type io_parallel --strategy
+Latency --pf 2 --clock 2.78 --mult-limit-fix --clone-fanout --reshape-channels --dsp-mult --auto-rewind`.
+Previous single-SLR designs (H1g, H2-d16s4, H3-*) are in "Full test set comparison" below.
 
 Graph changes are made on the PyTorch side in `tools/quantize/qat_deepsets.py`, which does the Brevitas
 wrapping (`network.py` stays Brevitas-free). Re-export with `tools/quantize/qat_deepsets_export_qonnx.py`.
@@ -91,6 +96,19 @@ Options:
   - This is how many of the 64 particles are processed in parallel. It must divide 64.
   - 64 means fully unrolled (~400k multipliers, which will not fit the VU13P).
   - PF=1 would loop over the particles and give no latency gain.
+- `--name STEM`: project stem, `hls_prj/deepsets_<STEM>_<opts>` (see below). Pass it for every trained graph.
+- `--clock NS` (default 5.0): target clock period. The single-SLR builds use 2.78 (360 MHz).
+- `--mult-limit-fix`, `--clone-fanout` (io_parallel): the II fixes in `io_parallel_report.md` §3. Always on.
+- `--reshape-channels` (io_parallel): `ARRAY_RESHAPE` instead of `ARRAY_PARTITION` on inter-layer arrays that no
+  pointwise conv touches, so each layer boundary is one DATAFLOW channel instead of one FIFO per element. Pragmas
+  only (C-sim unchanged); H1g 286k → 234k LUT, latency 100 → 34 cycles.
+- `--dsp-mult` / `--dsp-add`: bind multiplies (and adds/subs) to DSPs via `config_op`. Synthesis only.
+- `--auto-rewind` (io_parallel, 2026-10-03): fixes the C/RTL mismatch. Drops hls4ml's explicit conv `rewind`
+  (`nnet_conv1d_latency.h`) and adds an input-capture process in front of the first layer, so Vitis auto-rewinds
+  every conv. C-sim and II unchanged, 4-5% less LUT. Use it on every io_parallel build, and still run the cosim
+  check below: one build (d16 r2 floor) mismatched even with it.
+- The rounding of each activation type follows the QONNX `Quant` node's `rounding_mode`: `ROUND` →
+  `AP_RND_CONV`, `FLOOR` → `AP_TRN` (QAT `--round floor`). No flag needed.
 
 io_parallel run. Check C-sim parity against the qonnx line first, then synthesize with a 1 h cap:
 
@@ -107,9 +125,15 @@ python mini_parallel.py --full-quant --n 16 --phi 32,16 --rho 16 --pf 8         
 python mini_parallel.py --distillnet --n 32 --dim 16 --pf 2 [--phi-blocks 1 --rho-blocks 1]  # real student topology
 ```
 
+Quant-recipe and debug flags of `mini_parallel.py --distillnet` (2026-10-03; defaults = the 8-bit round recipe):
+`--w-bits`, `--a-bits`, `--in-bits`, `--tanh-bits`, `--tanh-in-max`, `--round {round,floor}` mirror the QAT flags
+for HLS cost probes (project suffix only for non-defaults, e.g. `_w9a9i12tm2_fl`). `--cut <onnx tensor>` ends the
+graph at that tensor (suffix `_cut<name>`), used to bisect C/RTL mismatches layer by layer. It also takes
+`--reshape-channels --dsp-mult --dsp-add --auto-rewind` like `convert.py`.
+
 Distillnet-topology synths need ~30 GB at n x dim = 512 and more than 55 GB at 1024. Run those alone.
 
-Each graph and option set writes its own project, `hls_prj/deepsets_<stem>_<io>_<strategy>_rf<N>[_pf<N>][_clk<ns>][_mlf][_clone][_dsp]`.
+Each graph and option set writes its own project, `hls_prj/deepsets_<stem>_<io>_<strategy>_rf<N>[_pf<N>][_clk<ns>][_mlf][_clone][_dsp][_dspadd][_rsh][_arw]`.
 
 - `<stem>` is `--name` if given, else `distillnet_8bit<graph suffix>` (the part of the file name after `_8bit`, e.g. `_fullQuant`).
 - All full-quant graphs share the suffix `_fullQuant`, so without `--name` a second graph overwrites the first one's project.
@@ -133,13 +157,25 @@ python csim_forward.py hls_prj/<project> [--npz top_test_full_n64.npz]
 - It prints acc, AUC and 1/eB at eS = 0.3, 0.5, 0.7, and saves the logits as `<project>/csim_forward_<npz>.npz`.
 - One core, about 50 s for 404k jets at n = 16 (io_parallel), a few minutes at n = 64 (io_stream).
 
+C/RTL co-simulation (the hls4ml testbench always reports "Pass", so compare the logs instead):
+
+```bash
+/tmp/alexmay_ps/cosim.sh TAG hls_prj/<project> 200     # SYNTH=1 to csynth first
+```
+
+- It writes 200 full-test jets into `tb_data/`, sets csim + cosim in `build_opt.tcl`, runs Vitis under
+  `synth.lock`, restores `build_opt.tcl` and compares C-sim against RTL (`cosim_tb.py detail` lists differing
+  elements). Exact means `max|d| 0`, 200/200 rows equal.
+- `/tmp/alexmay_ps/` can vanish; the scripts (`cosim.sh`, `cosim_tb.py`, `h2.sh`) are kept in the local
+  `helpers/` folder of the launching machine. `h2.sh` runs convert + synth, `csim_forward.py` and the cosim in one go.
+
 ### `convert.py` config
 
 - Vitis backend, part `xcvu13p-flga2577-2-e`. io type, strategy, reuse and PF come from the options above.
 - Default precision is `fixed<16,6>`. It is only a fallback: every type on the full-quant graph is set
   from the graph or inferred by hls4ml.
-- **Input:** the type of the input `Quant` (`fixed<8,*,RND_CONV,SAT>`, an 8-bit input port). The host
-  conversion is then that Quant (round-half-even, like qonnx).
+- **Input:** the type of the input `Quant` (`fixed<W,*,RND_CONV,SAT>`, or `AP_TRN` for a `FLOOR` Quant; 8 bits in
+  r7, 12 in H4). The host conversion is then that Quant, rounded like qonnx.
 - **Tanh fed by a `Quant` and feeding a `Quant`:**
   - One LUT entry per input code: `TableSize = 8 / input scale`, which is 256 for scale 1/32.
   - `table_t` and result are the output `Quant`'s type, which makes the LUT exact.
@@ -148,7 +184,8 @@ python csim_forward.py hls_prj/<project> [--npz top_test_full_n64.npz]
   exact. The accumulator also gets 6 more integer bits, so the 64-particle sum cannot overflow.
 - **ReLU not fused with a following `Quant`:** gets its input's type. hls4ml does not infer ReLU types,
   and the `fixed<16,6>` default truncates. This happens when a power-of-2 alpha other than 1 sits between
-  them.
+  them. A floor-quantized ReLU output is also TRN, so the rule also checks that the next ONNX node is not a
+  `Quant` (2026-10-03).
 - The pool and ReLU types are read from a first conversion (no compile), then the model is converted
   again.
 
@@ -287,7 +324,7 @@ full-quant graph.
 The 64-particle graph does not fit io_parallel; the single-SLR design uses a smaller student. History (tanh blocker,
 mini-model cost rules), the II and timing fixes, model knobs and the reproduce commands: `io_parallel_report.md`.
 
-## Full test set comparison (2026-10-01)
+## Full test set comparison (2026-10-01, single-SLR rows updated 2026-10-04)
 
 All 404k test jets (`top_test_full_n64.npz`). HLS rows are `csim_forward.py` C-sim, i.e. the exact
 hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quant QAT in torch.
@@ -298,7 +335,12 @@ hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quan
 | first QAT graph `_8bit` (same model, weights + Linear inputs only) | 64 | HLS | 0.9165 | 0.9756 | 523 | 143 | 46.3 |
 | r7 (same model, full-quant QAT) | 64 | HLS | 0.9205 | 0.9757 | 540 | 143 | 47.7 |
 | d12p2r1m1 float KD (`ps_d12p2r1m1_n16_e50`) | 16 | float | - | 0.9731 | 377 | 119 | 43.4 |
-| **H1g** d12p2r1m1 full-quant (current design) | 16 | HLS | 0.9106 | **0.9697** | 278 | 91.5 | 35.7 |
+| **H4-d18s4stk** d18p2r1m1, QAT floor + 9-bit + 12-bit input + tanh ±2 (current design) | 16 | HLS | 0.9191 | **0.9748** | 404 | 130.8 | 46.3 |
+| H4-d18r2s2stk d18p2r2m1, same QAT recipe | 16 | HLS | 0.9185 | 0.9745 | 388 | 125.3 | 45.7 |
+| H3-d16flb9 d16p2r1m1, QAT floor + 9-bit | 16 | HLS | 0.9166 | 0.9734 | 367 | 115.8 | 44.0 |
+| H3-d18s4 d18p2r1m1, QAT floor | 16 | HLS | 0.9151 | 0.9727 | 348 | 113.1 | 41.9 |
+| H2-d16s4 d16p2r1m1, r7 recipe | 16 | HLS | 0.9132 | 0.9719 | 340 | 109.1 | 40.9 |
+| H1g d12p2r1m1 full-quant (design until 2026-10-03) | 16 | HLS | 0.9106 | 0.9697 | 278 | 91.5 | 35.7 |
 | d8p2r1 float KD (`ps_d8p2r1_n16_e50`) | 16 | float | - | 0.9685 | 274 | 88.1 | 33.0 |
 | twamorka `qat_top_deepsets_mac_d8p2r1_n16_a05_T4_8bit_po2` | 16 | Brevitas | 0.9086 | 0.9677 | 262 | 85.3 | 31.4 |
 | H1r d8p2r1 full-quant (smaller fallback) | 16 | HLS | 0.9074 | 0.9666 | 234 | 78.1 | 30.0 |
@@ -314,7 +356,8 @@ hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quan
   only; DyT, residual and pool in float). It beats H1r (same shape) in software but has no HLS number,
   and that recipe was not bit-exact in HLS. Its `po2` option is not recorded in `arch_config`.
 - r7's input `Quant` (8-bit, 1/32) saturates at 3.97, so log pT / log E above that (typical values ~5)
-  are clipped. H1g learned 1/16 (range +-8). Not measured how much this costs r7.
+  are clipped. H1g learned 1/16 (range +-8). Not measured how much this costs r7. The d16 r7-recipe graph also
+  learned ±8; its 12-bit input (H4) keeps ±8 at step 1/256, so the 2026-10-04 input-bits gain is resolution, not range.
 - Scripts for the non-HLS rows are outside the repo on Perlmutter, in
   `/pscratch/sd/a/alexmay/omnilearned/logs/ps/`: `eval_float_ckpt.py`, `eval_qat_ckpt.py`
   (strict-loads a non-full-quant QAT checkpoint from its `arch_config`), `qonnx_forward.py` (128-process
@@ -322,20 +365,28 @@ hardware output. Float rows are torch on the checkpoint; "Brevitas" is fake-quan
 
 ## Next steps
 
-Roughly in priority order. Hardware next steps for H1g (Vivado P&R, LUT headroom): `io_parallel_report.md` §6.
+Roughly in priority order. Hardware next steps (Vivado P&R of H4, auto-rewind root cause): `io_parallel_report.md` §6.
 
 ### Further quantization (NERSC side, needs QAT)
 
-1. **Narrower pre-requantization sums.** The residual `Add`s are still computed at the MatMul accumulator
+Done 2026-10-03/04 (run log QP-QZ4, H3-*, H4-*): floor rounding (−10% LUT, AUC unchanged), 9-bit weights and
+activations (+0.002 AUC), 12-bit input, tanh input range ±2. Fewer bits hurt: a7 −0.003, a6 −0.010, w6 −0.010,
+w4 broken; `--res-bits` 8/12 and `--no-relu-uint` gave nothing; 10-bit = 9-bit.
+
+1. **Bias clipping.** `Int16Bias` sits on the accumulator grid (`s_input × s_weight`). In H4 the 12-bit input
+   makes embed fc1's grid 2^-17, so its bias range is ±0.25 and 1 of 18 biases clips; 3 of 18 phi.fc1 biases clip
+   at ±1. QAT, C-sim and RTL all clip the same way (not a correctness bug). Fix: a `--bias-bits` QAT flag
+   (default 16), e.g. 20; cost should be ~0 LUT.
+2. **Input bits.** Only 8 / 10 / 12 were trained, on d16 (10 and 12 tie). Try `--in-bits 9` / `10` with the stk
+   recipe on d18 s4.
+3. **Per-layer precision** (more bits in rho/out, which are per jet and cheap; fewer in embed/phi). Not tried.
+4. **Narrower pre-requantization sums.** The residual `Add`s are still computed at the MatMul accumulator
    width (24-bit) before the 10-bit `Quant`. An output quantizer on `phi.fc2` / `rho.fc2` would shrink
    the adders; check whether HLS already trims them first.
-2. **7-bit unsigned inputs after ReLU** (same resolution as the old signed 8-bit).
-3. **Optional output quantizer** on the logits (now `fixed<22,8>`), if the output port width matters
+5. **Optional output quantizer** on the logits (now `fixed<24,8>`), if the output port width matters
    downstream.
-4. **Lower weight bit-widths** (e.g. 6-bit, or 4-bit where tolerated) for DSP/LUT savings. This is a
-   separate precision-vs-AUC scan.
 
 ### Housekeeping
 
-5. Report the six hls4ml bugs, the ignored `Precision["table"]` and the missing `GlobalPooling1D`/ReLU
+6. Report the six hls4ml bugs, the explicit conv `rewind` C/RTL bug (worked around by `--auto-rewind`), the ignored `Precision["table"]` and the missing `GlobalPooling1D`/ReLU
     type inference upstream (or to the qibin2020 fork), so `convert.py` can drop its monkeypatches.

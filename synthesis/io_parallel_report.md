@@ -31,7 +31,11 @@ cosim (local `helpers/h2.sh` does it); the current best H4-d18s4stk is exact on 
 
 | design (trained, full-quant) | build | II cycles / ns | LUT / FF / DSP % SLR | clock est. | latency | AUC 9984 jets | AUC / 1/eB@0.5, all 404k jets |
 |---|---|---|---|---|---|---|---|
-| **H2-d16: d16p2r1m1, n 16** (2026-10-03) | PF 2, 360 MHz, `--reshape-channels --dsp-mult` | 8 / 22.2 | 74 / 25 / 18 | 1.96 ns | 34 cyc = 94 ns | 0.9699 | **0.9703 / 99.4** |
+| **H4-d18s4stk: d18p2r1m1, n 16**, QAT floor + 9-bit + 12-bit input + tanh ±2 (2026-10-04) | PF 2, 360 MHz, `--reshape-channels --dsp-mult --auto-rewind` | 8 / 22.2 | 69 / 33 / 36 | 2.07 ns | 34 cyc = 94 ns | | **0.9748 / 130.8** |
+| H4-d18r2s2stk: d18p2r2m1, same QAT recipe | as H4 | 8 / 22.2 | 74 / 35 / 41 | 2.18 ns | 97 ns | | 0.9745 / 125.3 |
+| H3-d16flb9: d16p2r1m1, QAT floor + 9-bit | as H4 | 8 / 22.2 | 58 / 28 / 27 | 2.18 ns | 94 ns | | 0.9734 / 115.8 |
+| H3-d18s4: d18p2r1m1, QAT floor | as H4 | 8 / 22.2 | 64 / 26 / 19 | 2.06 ns | 89 ns | | 0.9727 / 113.1 |
+| H2-d16s4: d16p2r1m1, r7 recipe, best of 6 seeds | as H4 | 8 / 22.2 | 69 / 23 / 17 | 1.96 ns | 89 ns | | 0.9719 / 109.1 |
 | H1g + `--reshape-channels` | PF 2, 360 MHz | 8 / 22.2 | 57 / 19 / 0 | 2.03 ns | 34 cyc = 94 ns | 0.9685 | 0.9697 / 91.5 |
 | H1g: d12p2r1m1, n 16 (mlp_ratio 1) | PF 2, 360 MHz | 8 / 22.2 | 66 / 21 / 0 | 2.03 ns | 100 cyc = 278 ns | 0.9685 | 0.9697 / 91.5 |
 | H1r: d8p2r1, n 16 | PF 2, 360 MHz | 8 / 22.2 | 59 / 18 / 0 | 1.96 ns | 275 ns | 0.9653 | 0.9666 / 78.1 |
@@ -39,8 +43,13 @@ cosim (local `helpers/h2.sh` does it); the current best H4-d18s4stk is exact on 
 | d8p2r1, n 16 | PF 4, 200 MHz | 4 / 20.0 | 67 / 15 / 0 | 3.65 ns | 300 ns | 0.9653 | |
 | d8p2r1, n 16 | PF 2, 320 MHz | 8 / 25.0 | 57 / 17 / 0 | 2.28 ns | | 0.9653 | |
 
-- **H2-d16 is the current design (2026-10-03).** The two LUT knobs of §3b free enough room for d16. It is one
-  training seed: seed-to-seed spread at d12 is ~0.003 AUC and ~20% in 1/eB, so more seeds are in the run log.
+- **H4-d18s4stk is the current design (2026-10-04).** Floor rounding frees ~10% LUT at no AUC cost, which buys
+  d18; 9-bit weights and activations, a 12-bit input and a ±2 tanh input range add ~+0.002 AUC and ~+15% 1/eB on
+  top. Seed s4 is the validation pick of 4 float seeds, QAT run r1 the lowest QAT validation loss of 3. All rows
+  above H1g are built with `--auto-rewind` and are exact in C/RTL cosim (200 jets; H4 2000). Details:
+  local `quant_scan_summary_2026-10-04.md`, run log QP-QZ4, H3-*, H4-*.
+- **H2-d16s4 was the design on 2026-10-03** (the 2026-10-03 row "H2-d16", 0.9703, was seed e50; s4 is the
+  validation pick of 6). Seed-to-seed spread is ~0.003 AUC and ~20% in 1/eB.
 - **H1g was the design until 2026-10-03.** It meets all three limits, and it is bit-exact (max |Δ logit| = 0) between QONNX and
   HLS C-sim. Its float model scores 0.9731 (all 404k jets).
 - **H1r / H1f are the smaller fallback.** `--dsp-mult` moves 328 multiplies to DSPs for −5% LUT, with the same II,
@@ -211,26 +220,30 @@ Shapes that fit one SLR at II 8 cycles (random weights, 360 MHz):
 
 ## 6. Next steps
 
-0. (2026-10-04) Current best **H4-d18s4stk**: d18p2r1m1 n16, QAT `--round floor --bits 9 --in-bits 12 --tanh-in-max 2`,
-   PF2 360 MHz with `--auto-rewind`: 69% LUT, 36% DSP, II 22.2 ns, AUC 0.9748, 1/eB@0.5 130.8, cosim exact. Floor
-   rounding frees ~10% LUT at no AUC cost; 9 bits, 12-bit input and tanh range 2 add ~+0.002 AUC (run log QZ1-QZ4).
-   Next: Vivado P&R of H4; root cause of the remaining auto-rewind failure (d16 r2 floor build).
+Current best: **H4-d18s4stk** (§Summary). Open items, roughly in priority order:
 
-1. **Vivado synthesis and place-and-route of H1g** at 360 MHz with a pblock on one SLR. csynth estimates 2.03 ns
-   against 2.78 ns, but routed timing at 66% LUT is the real question. The 200 MHz PF 4 build is the fallback.
-2. **Use the LUT headroom (66% → 80%):** d14p2r1m1 n16, or d12p2r1m1 at n 24 (PF 3). d16p2r1m1 n16 was 92% at
-   random weights. `--dsp-mult` on H1g would free ~5% LUT more.
-3. **Input range:** r7's input Quant saturates at 3.97 (log pT / log E are ~5); H1g learned ±8. Check whether a
-   fixed wider input range helps the small models too.
+1. **Vivado synthesis and place-and-route of H4** at 360 MHz with a pblock on one SLR. csynth estimates 2.07 ns
+   against 2.78 ns, but routed timing at 69% LUT is the real question.
+2. **Root cause of the remaining auto-rewind failure.** The d16 r2 floor build (H3-d16r2fl) still differs in
+   cosim with `--auto-rewind` (exact at 5 ns or with Vitis auto-rewind off, II 15; run log R2-*). Until it is
+   understood, every build needs the 200-jet cosim check.
+3. **Bias clipping.** `Int16Bias` sits on the accumulator grid; with the 12-bit input, embed fc1's bias range is
+   ±0.25 and 1 of 18 biases clips (3 of 18 in phi.fc1 at ±1). Add a `--bias-bits` QAT flag (default 16) and retrain
+   QAT with e.g. 20 bits.
+4. **Input bits.** Only 8 / 10 / 12 were trained (d16; 10 and 12 tie). Try 9 / 10 with the stk recipe on d18.
+5. **Per-layer precision** (more bits in the per-jet rho/out layers, fewer in embed/phi). Not tried.
 
 ## 7. Reproduce
 
 Training (nersc, branch `synthesis`, on gpu_interactive):
 
 ```
-SIZE=d12p2r1m1 N=16 FLOAT_TAG=ps_d12p2r1m1_n16_e50 setsid nohup salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 \
-    --gpus-per-node 4 -A m3246 bash scripts/fullquant_chain.sbatch > <log> 2>&1 < /dev/null &
-# -> qonnx/fpga/qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx
+# spec: one chain per line, e.g. for H4 (float s4 exists, so this is QAT only):
+# FLOAT_TAG=ps_d18p2r1m1_n16_e50_s4 QAT_TAG=qat_ps_d18p2r1m1_n16_e50_s4_stk_r1 EVAL=1 DATA=/pscratch/sd/a/alexmay/omnilearned_data/ \
+#     QAT_ARGS="--round floor --bits 9 --in-bits 12 --tanh-in-max 2"
+setsid nohup salloc -C gpu -q interactive -t 240 --nodes 1-4 --ntasks-per-node 4 --gpus-per-node 4 -A m2616 \
+    bash scripts/fullquant_multi.sh <spec> > <log> 2>&1 < /dev/null &
+# -> qonnx/fpga/<qat_tag>_clean.onnx
 ```
 
 `fullquant_chain.sbatch` (formerly `ps_final.sbatch`) runs three stages:
@@ -241,8 +254,10 @@ SIZE=d12p2r1m1 N=16 FLOAT_TAG=ps_d12p2r1m1_n16_e50 setsid nohup salloc -C gpu -q
 HLS (rdsrv, `synthesis/`):
 
 ```
-python convert.py --onnx onnx_graphs/qat_ps_d12p2r1m1_n16_e50_8bit_fullQuant_clean.onnx --name ps_d12p2r1m1_n16 \
-    --io-type io_parallel --strategy Latency --pf 2 --mult-limit-fix --clone-fanout --clock 2.78 --synth
+python convert.py --onnx onnx_graphs/qat_ps_d18p2r1m1_n16_e50_s4_stk_r1_clean.onnx --name ps_d18p2r1m1_n16_s4_stk \
+    --io-type io_parallel --strategy Latency --pf 2 --mult-limit-fix --clone-fanout --clock 2.78 \
+    --reshape-channels --dsp-mult --auto-rewind --synth
+/tmp/alexmay_ps/cosim.sh COSIM-<tag> hls_prj/<project> 200   # C/RTL check; copy in the local helpers/
 python csim_forward.py hls_prj/<project>          # all 404k test jets
 python csynth_summary.py hls_prj/<project> [log]  # II, clock, % SLR
 ```
@@ -250,7 +265,10 @@ python csynth_summary.py hls_prj/<project> [log]  # II, clock, % SLR
 Random-weight probes: `mini_parallel.py --distillnet ...` with the flags in the run log.
 
 Kept projects (`synthesis/hls_prj/`, not in git):
-- `deepsets_ps_d12p2r1m1_n16_io_parallel_pf2_clk2.78_mlf_clone` (H1g, current design);
+- `deepsets_ps_d18p2r1m1_n16_s4_stk_io_parallel_latency_rf1_pf2_clk2.78_mlf_clone_dsp_rsh_arw` (H4-d18s4stk, current design);
+- `..._d18p2r2m1_n16_s2_stk_..._arw` (H4-d18r2s2stk), `..._d16p2r1m1_n16_s4_flb9_..._arw` (H3-d16flb9),
+  `..._d18p2r1m1_n16_s4_fl_..._arw` (H3-d18s4), `..._d16p2r1m1_n16_s4_..._dsp_rsh_arw` (H2-d16s4);
+- `deepsets_ps_d12p2r1m1_n16_io_parallel_pf2_clk2.78_mlf_clone` (H1g);
 - `deepsets_ps_d8p2r1_n16_io_parallel_pf2_clk2.78_mlf_clone` (H1r);
 - `deepsets_distillnet_8bit_fullQuant_io_parallel_latency_rf1_pf2_clk2.78_mlf_clone_dsp` (H1f, d8p2r1 graph);
 - `deepsets_distillnet_8bit_fullQuant_r7_io_stream_resource_rf1` (r7 reference);
