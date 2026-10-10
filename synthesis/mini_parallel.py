@@ -80,6 +80,9 @@ p.add_argument("--in-bits", type=int, default=None, help="--distillnet: input Qu
 p.add_argument("--tanh-bits", type=int, default=None, help="--distillnet: tanh input bits (default --a-bits)")
 p.add_argument("--tanh-in-max", type=float, default=4.0, help="--distillnet: tanh input range [-x, x)")
 p.add_argument("--round", choices=["round", "floor"], default="round", help="activation Quant rounding (weights: round)")
+p.add_argument("--sparsity", type=float, default=0.0,
+               help="zero this fraction of each MatMul's weights, smallest |w| first, except the first and the logits "
+                    "MatMul (as qat_deepsets.py --prune)")
 p.add_argument("--io-type", default="io_parallel", choices=["io_parallel", "io_stream"])
 p.add_argument("--clock", type=float, default=5.0, help="target clock period in ns")
 p.add_argument("--rf", type=int, default=1, help="ReuseFactor of the per-particle layers")
@@ -116,6 +119,7 @@ else:
     OUT_DIR = f"hls_prj/mini{'_fq' if fq else ''}_n{args.n}_phi{'-'.join(map(str, phi))}_rho{'-'.join(map(str, rho))}_pf{pf}"
 levers = [(f"rf{args.rf}", args.rf > 1), ("mlf", args.mult_limit_fix), ("dsp", args.dsp_mult)]
 levers += [("dspadd", args.dsp_add), ("rsh", args.reshape_channels), ("arw", args.auto_rewind)]
+levers += [(f"sp{round(100 * args.sparsity)}", args.sparsity > 0)]
 levers += [(str(args.pipeline_style), args.pipeline_style), ("stream", stream), (f"clk{args.clock:g}", args.clock != 5)]
 levers += [(f"ii{args.pipeline_ii}", args.pipeline_ii)]
 levers += [(str(args.strategy).lower(), args.strategy and args.strategy != ("Resource" if stream else "Latency"))]
@@ -211,7 +215,7 @@ onnx_to_hls.parse_onnx_model = _parse_onnx_drop_pool_transpose
 
 # --- build the QONNX graph ---
 rng = np.random.default_rng(0)
-nodes, inits, macs = [], [], []  # macs: d_in * d_out per MatMul, in graph order
+nodes, inits, macs, nnz = [], [], [], []  # macs: d_in * d_out per MatMul, in graph order; nnz: its nonzero weights
 
 
 def const(name, value):
@@ -246,7 +250,10 @@ def matmul(x, d_in, d_out, out=None, in_scale=None):
     i = count("MatMul")
     w = rng.normal(0, 1 / np.sqrt(d_in), (d_in, d_out))
     w_scale = 2.0 ** np.ceil(np.log2(np.abs(w).max() / (2 ** (args.w_bits - 1) - 1)))
+    if args.sparsity and i > 0 and out != "logits":  # magnitude pruning; no rng draws, so other weights are unchanged
+        w.flat[np.argsort(np.abs(w), axis=None)[: round(args.sparsity * w.size)]] = 0
     macs.append(d_in * d_out)
+    nnz.append(np.count_nonzero(np.round(w / w_scale)))
     mm_out = f"MatMul_{i}_out" if in_scale else out or f"MatMul_{i}_out"
     nodes.append(helper.make_node("MatMul", [x, quant(const(f"W_{i}", w), w_scale, 1, narrow=1, bits=args.w_bits, rounding="ROUND")], [mm_out], name=f"MatMul_{i}"))
     if not in_scale:
@@ -556,7 +563,8 @@ xin = (np.round(rng.normal(0, 2, (BATCH, args.n, 4)) / IN_SCALE) * IN_SCALE).cli
 ref = execute_onnx(model, {"global_in": xin})[model.graph.output[0].name]
 hls = np.asarray(hls_model.predict(np.ascontiguousarray(xin))).reshape(ref.shape)
 print(f"[random] max|dlogit|={np.abs(ref - hls).max():.4g} argmax agree={np.mean(ref.argmax(1) == hls.argmax(1)):.3f}")
-print(f"[model] {OUT_DIR} per-particle MatMuls={n_pp} MACs/jet={args.n * sum(macs[:n_pp]) + sum(macs[n_pp:])}")
+print(f"[model] {OUT_DIR} per-particle MatMuls={n_pp} MACs/jet={args.n * sum(macs[:n_pp]) + sum(macs[n_pp:])} "
+      f"nonzero weights={sum(nnz)}/{sum(macs)}")
 
 if args.synth and np.abs(ref - hls).max() > 0:
     raise SystemExit("C-sim is not bit-exact: no synthesis")
