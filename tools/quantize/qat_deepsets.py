@@ -304,6 +304,33 @@ def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True,
     return model
 
 
+def prune_hidden_linears(model, optimizer, frac, total_steps):
+    """Unstructured magnitude pruning, per layer, of every QuantLinear except embed fc1 (4 inputs) and the output
+    layer. After each optimizer step the smallest-|w| fraction frac * (1 - (1 - t)^3) of each weight is set to 0, with
+    t = step / (0.6 * total_steps) capped at 1 (Zhu & Gupta cubic ramp, then fine-tuning at frac). A zero weight
+    quantizes to an exact 0, checkpoints hold the zeros (train_model saves after validation), and the hls4ml
+    io_parallel weights are constants, so Vitis drops those multipliers."""
+    skip = (model.body.embed.fc1, model.classifier.out)
+    layers = [m for m in model.modules() if type(m).__name__ == "QuantLinear" and m not in skip]
+    ramp = max(1, int(0.6 * total_steps))  # ponytail: fixed ramp end, add a flag if the schedule needs tuning
+    step = 0
+
+    @torch.no_grad()
+    def apply(*_):
+        nonlocal step
+        step += 1
+        s = frac * (1 - (1 - min(step / ramp, 1.0)) ** 3)
+        for m in layers:
+            k = round(s * m.weight.numel())
+            if k:
+                w = m.weight
+                w.mul_(w.abs() > w.abs().flatten().kthvalue(k).values)
+
+    optimizer.register_step_post_hook(apply)
+    if is_master_node():
+        print(f"Pruning {len(layers)} QuantLinear layers to {frac:.0%} by step {ramp} of {total_steps}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True, help="float checkpoint to start from: <init-dir>/best_model_<tag>.pt")
@@ -342,6 +369,8 @@ def main():
                     help="quantize the residual stream and pool output to this many bits (0 = off)")
     ap.add_argument("--relu-uint", action=argparse.BooleanOptionalAction, default=True,
                     help="unsigned input quantizer for Linears fed by a ReLU (phi/rho fc2)")
+    ap.add_argument("--prune", type=float, default=0.0,
+                    help="magnitude-prune this fraction of each hidden Linear's weights (prune_hidden_linears; 0 = off)")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
@@ -394,6 +423,7 @@ def main():
             "tanh_in_max": args.tanh_in_max,  # 0 = learned tanh-input range
             "res_bits": args.res_bits,  # residual stream + pool QuantIdentity bits (0 = off)
             "relu_uint": args.relu_uint,  # unsigned input quant after ReLU
+            "prune": args.prune,  # hidden-Linear weight sparsity (record only; the zeros are in the weights)
         },
     }
     if is_master_node():
@@ -421,6 +451,8 @@ def main():
         num_warmup_steps=int(train_steps * args.warmup_epoch),
         num_training_steps=train_steps * args.epochs,
     )
+    if args.prune:
+        prune_hidden_linears(model, optimizer, args.prune, train_steps * args.epochs)
 
     kwarg = {}
     if torch.cuda.is_available():
