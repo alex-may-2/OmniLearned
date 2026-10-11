@@ -304,9 +304,9 @@ def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True,
     return model
 
 
-def prune_hidden_linears(model, optimizer, frac, ramp_steps, embed_frac=None):
+def prune_hidden_linears(model, optimizer, frac, ramp_steps, embed_frac=None, rho_frac=None):
     """Unstructured magnitude pruning, per layer, of every QuantLinear except embed fc1 (4 inputs) and the output
-    layer; embed fc2 goes to embed_frac (default frac). After each optimizer step the smallest-|w| fraction
+    layer; embed fc2 goes to embed_frac and the rho Linears to rho_frac (default frac; 0 = dense). After each optimizer step the smallest-|w| fraction
     f * (1 - (1 - t)^3) of each weight is set to 0, with t = step / ramp_steps capped at 1 (Zhu & Gupta cubic ramp,
     then fine-tuning at f). main() ends the ramp with the first (warmup) epoch, so every validated checkpoint, and
     hence best_model, has the full sparsity. A zero weight quantizes to an exact 0, checkpoints hold the zeros
@@ -314,7 +314,9 @@ def prune_hidden_linears(model, optimizer, frac, ramp_steps, embed_frac=None):
     multipliers."""
     skip = (model.body.embed.fc1, model.classifier.out)
     embed_frac = frac if embed_frac is None else embed_frac
-    layers = [(m, embed_frac if m is model.body.embed.fc2 else frac)
+    rho_frac = frac if rho_frac is None else rho_frac
+    rho = {id(m) for m in model.classifier.rho.modules()}
+    layers = [(m, embed_frac if m is model.body.embed.fc2 else rho_frac if id(m) in rho else frac)
               for m in model.modules() if type(m).__name__ == "QuantLinear" and m not in skip]
     step = 0
 
@@ -331,8 +333,8 @@ def prune_hidden_linears(model, optimizer, frac, ramp_steps, embed_frac=None):
 
     optimizer.register_step_post_hook(apply)
     if is_master_node():
-        print(f"Pruning {len(layers)} QuantLinear layers to {frac:.0%} (embed fc2 {embed_frac:.0%}) by step "
-              f"{ramp_steps}")
+        print(f"Pruning {len(layers)} QuantLinear layers to {frac:.0%} (embed fc2 {embed_frac:.0%}, rho {rho_frac:.0%}) "
+              f"by step {ramp_steps}")
 
 
 def main():
@@ -377,6 +379,8 @@ def main():
                     help="magnitude-prune this fraction of each hidden Linear's weights (prune_hidden_linears; 0 = off)")
     ap.add_argument("--prune-embed", type=float, default=None,
                     help="with --prune: embed fc2's fraction instead (0 = keep it dense; default --prune)")
+    ap.add_argument("--prune-rho", type=float, default=None,
+                    help="with --prune: the rho Linears' fraction instead (0 = keep them dense; default --prune)")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
@@ -431,6 +435,7 @@ def main():
             "relu_uint": args.relu_uint,  # unsigned input quant after ReLU
             "prune": args.prune,  # hidden-Linear weight sparsity (record only; the zeros are in the weights)
             "prune_embed": args.prune if args.prune_embed is None else args.prune_embed,  # embed fc2's sparsity
+            "prune_rho": args.prune if args.prune_rho is None else args.prune_rho,  # rho Linears' sparsity
         },
     }
     if is_master_node():
@@ -459,7 +464,7 @@ def main():
         num_training_steps=train_steps * args.epochs,
     )
     if args.prune:
-        prune_hidden_linears(model, optimizer, args.prune, train_steps, args.prune_embed)  # ramp = first epoch
+        prune_hidden_linears(model, optimizer, args.prune, train_steps, args.prune_embed, args.prune_rho)  # 1-epoch ramp
 
     kwarg = {}
     if torch.cuda.is_available():
