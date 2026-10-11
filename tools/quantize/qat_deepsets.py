@@ -304,31 +304,35 @@ def wrap_linears_qat(model, bits, tanh_in_max=4.0, res_bits=10, relu_uint=True,
     return model
 
 
-def prune_hidden_linears(model, optimizer, frac, total_steps):
+def prune_hidden_linears(model, optimizer, frac, ramp_steps, embed_frac=None):
     """Unstructured magnitude pruning, per layer, of every QuantLinear except embed fc1 (4 inputs) and the output
-    layer. After each optimizer step the smallest-|w| fraction frac * (1 - (1 - t)^3) of each weight is set to 0, with
-    t = step / (0.6 * total_steps) capped at 1 (Zhu & Gupta cubic ramp, then fine-tuning at frac). A zero weight
-    quantizes to an exact 0, checkpoints hold the zeros (train_model saves after validation), and the hls4ml
-    io_parallel weights are constants, so Vitis drops those multipliers."""
+    layer; embed fc2 goes to embed_frac (default frac). After each optimizer step the smallest-|w| fraction
+    f * (1 - (1 - t)^3) of each weight is set to 0, with t = step / ramp_steps capped at 1 (Zhu & Gupta cubic ramp,
+    then fine-tuning at f). main() ends the ramp with the first (warmup) epoch, so every validated checkpoint, and
+    hence best_model, has the full sparsity. A zero weight quantizes to an exact 0, checkpoints hold the zeros
+    (train_model saves after validation), and the hls4ml io_parallel weights are constants, so Vitis drops those
+    multipliers."""
     skip = (model.body.embed.fc1, model.classifier.out)
-    layers = [m for m in model.modules() if type(m).__name__ == "QuantLinear" and m not in skip]
-    ramp = max(1, int(0.6 * total_steps))  # ponytail: fixed ramp end, add a flag if the schedule needs tuning
+    embed_frac = frac if embed_frac is None else embed_frac
+    layers = [(m, embed_frac if m is model.body.embed.fc2 else frac)
+              for m in model.modules() if type(m).__name__ == "QuantLinear" and m not in skip]
     step = 0
 
     @torch.no_grad()
     def apply(*_):
         nonlocal step
         step += 1
-        s = frac * (1 - (1 - min(step / ramp, 1.0)) ** 3)
-        for m in layers:
-            k = round(s * m.weight.numel())
+        r = 1 - (1 - min(step / ramp_steps, 1.0)) ** 3
+        for m, f in layers:
+            k = round(f * r * m.weight.numel())
             if k:
                 w = m.weight
                 w.mul_(w.abs() > w.abs().flatten().kthvalue(k).values)
 
     optimizer.register_step_post_hook(apply)
     if is_master_node():
-        print(f"Pruning {len(layers)} QuantLinear layers to {frac:.0%} by step {ramp} of {total_steps}")
+        print(f"Pruning {len(layers)} QuantLinear layers to {frac:.0%} (embed fc2 {embed_frac:.0%}) by step "
+              f"{ramp_steps}")
 
 
 def main():
@@ -371,6 +375,8 @@ def main():
                     help="unsigned input quantizer for Linears fed by a ReLU (phi/rho fc2)")
     ap.add_argument("--prune", type=float, default=0.0,
                     help="magnitude-prune this fraction of each hidden Linear's weights (prune_hidden_linears; 0 = off)")
+    ap.add_argument("--prune-embed", type=float, default=None,
+                    help="with --prune: embed fc2's fraction instead (0 = keep it dense; default --prune)")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
@@ -424,6 +430,7 @@ def main():
             "res_bits": args.res_bits,  # residual stream + pool QuantIdentity bits (0 = off)
             "relu_uint": args.relu_uint,  # unsigned input quant after ReLU
             "prune": args.prune,  # hidden-Linear weight sparsity (record only; the zeros are in the weights)
+            "prune_embed": args.prune if args.prune_embed is None else args.prune_embed,  # embed fc2's sparsity
         },
     }
     if is_master_node():
@@ -452,7 +459,7 @@ def main():
         num_training_steps=train_steps * args.epochs,
     )
     if args.prune:
-        prune_hidden_linears(model, optimizer, args.prune, train_steps * args.epochs)
+        prune_hidden_linears(model, optimizer, args.prune, train_steps, args.prune_embed)  # ramp = first epoch
 
     kwarg = {}
     if torch.cuda.is_available():
