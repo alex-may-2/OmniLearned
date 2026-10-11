@@ -83,6 +83,10 @@ p.add_argument("--round", choices=["round", "floor"], default="round", help="act
 p.add_argument("--sparsity", type=float, default=0.0,
                help="zero this fraction of each MatMul's weights, smallest |w| first, except the first and the logits "
                     "MatMul (as qat_deepsets.py --prune)")
+p.add_argument("--sparsity-embed", type=float, default=None,
+               help="--distillnet: embed fc2's (MatMul_1) fraction instead (0 = dense; default --sparsity, as --prune-embed)")
+p.add_argument("--sparsity-rho", type=float, default=None,
+               help="--distillnet: the rho MatMuls' fraction instead (0 = dense; default --sparsity, as --prune-rho)")
 p.add_argument("--io-type", default="io_parallel", choices=["io_parallel", "io_stream"])
 p.add_argument("--clock", type=float, default=5.0, help="target clock period in ns")
 p.add_argument("--rf", type=int, default=1, help="ReuseFactor of the per-particle layers")
@@ -99,6 +103,7 @@ p.add_argument("--strategy", choices=["Latency", "Resource"], default=None, help
 p.add_argument("--synth", action="store_true")
 args = p.parse_args()
 args.in_bits, args.tanh_bits = args.in_bits or args.a_bits, args.tanh_bits or args.a_bits
+sp = {k: args.sparsity if v is None else v for k, v in [("embed", args.sparsity_embed), ("rho", args.sparsity_rho)]}
 A = 2.0 ** (8 - args.a_bits)  # a-bit activations keep the 8-bit ranges
 ACT_SCALE, TANH_OUT_SCALE = ACT_SCALE * A, TANH_OUT_SCALE * A
 TANH_IN_SCALE = args.tanh_in_max / 2 ** (args.tanh_bits - 1)
@@ -119,7 +124,8 @@ else:
     OUT_DIR = f"hls_prj/mini{'_fq' if fq else ''}_n{args.n}_phi{'-'.join(map(str, phi))}_rho{'-'.join(map(str, rho))}_pf{pf}"
 levers = [(f"rf{args.rf}", args.rf > 1), ("mlf", args.mult_limit_fix), ("dsp", args.dsp_mult)]
 levers += [("dspadd", args.dsp_add), ("rsh", args.reshape_channels), ("arw", args.auto_rewind)]
-levers += [(f"sp{round(100 * args.sparsity)}", args.sparsity > 0)]
+sp_tag = f"sp{round(100 * args.sparsity)}" + "".join(f"{k[0]}{round(100 * v)}" for k, v in sp.items() if v != args.sparsity)
+levers += [(sp_tag, max(args.sparsity, *sp.values()) > 0)]
 levers += [(str(args.pipeline_style), args.pipeline_style), ("stream", stream), (f"clk{args.clock:g}", args.clock != 5)]
 levers += [(f"ii{args.pipeline_ii}", args.pipeline_ii)]
 levers += [(str(args.strategy).lower(), args.strategy and args.strategy != ("Resource" if stream else "Latency"))]
@@ -215,6 +221,7 @@ onnx_to_hls.parse_onnx_model = _parse_onnx_drop_pool_transpose
 
 # --- build the QONNX graph ---
 rng = np.random.default_rng(0)
+in_rho = False
 nodes, inits, macs, nnz = [], [], [], []  # macs: d_in * d_out per MatMul, in graph order; nnz: its nonzero weights
 
 
@@ -250,8 +257,9 @@ def matmul(x, d_in, d_out, out=None, in_scale=None):
     i = count("MatMul")
     w = rng.normal(0, 1 / np.sqrt(d_in), (d_in, d_out))
     w_scale = 2.0 ** np.ceil(np.log2(np.abs(w).max() / (2 ** (args.w_bits - 1) - 1)))
-    if args.sparsity and i > 0 and out != "logits":  # magnitude pruning; no rng draws, so other weights are unchanged
-        w.flat[np.argsort(np.abs(w), axis=None)[: round(args.sparsity * w.size)]] = 0
+    s = sp["embed"] if args.distillnet and i == 1 else sp["rho"] if in_rho else args.sparsity
+    if s and i > 0 and out != "logits":  # magnitude pruning; no rng draws, so other weights are unchanged
+        w.flat[np.argsort(np.abs(w), axis=None)[: round(s * w.size)]] = 0
     macs.append(d_in * d_out)
     nnz.append(np.count_nonzero(np.round(w / w_scale)))
     mm_out = f"MatMul_{i}_out" if in_scale else out or f"MatMul_{i}_out"
@@ -329,6 +337,7 @@ if args.distillnet:
         x = res_quant(residual(x, d, hidden, 8.0, A * 2.0**-6), 2.0**-6)
     n_pp = count("MatMul")
     x = res_quant(pool(x), 2.0**-9)
+    in_rho = True  # matmul(): rho MatMuls take --sparsity-rho
     for _ in range(args.rho_blocks):
         x = residual(x, d, (args.rho_ratio or args.ratio) * d, 8.0, A * 2.0**-7)
     out_scale = TANH_OUT_SCALE if args.res_bits else ACT_SCALE  # r7: 8-bit 1/128 before the output Linear
