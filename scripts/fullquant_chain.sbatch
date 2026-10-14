@@ -19,6 +19,10 @@
 #   SRUN_OPTS step placement, e.g. "-N1 -n4 -c 32 --exact" for one chain per node of a multi-node allocation
 #             (scripts/fullquant_multi.sh); each step then rendezvouses on its own node
 #   EVAL=1    stage 4: qat_deepsets_eval.py on the full test set -> $LOGS/${QAT_TAG}_eval.txt
+#   NO_KD=1   float stage trains from scratch on truth labels (no --distill); QAT still distills
+#   SEED=N    --seed N for the float stage (default unseeded)
+#   SCORES=1  per-jet test scores for ROC plots in $BASE/eval/ps/: float eval after stage 1, and
+#             qat_deepsets_eval.py --save-scores in stage 4 (needs EVAL=1)
 #SBATCH -A m3246
 #SBATCH -C gpu
 #SBATCH -q regular
@@ -53,16 +57,24 @@ SRUN_OPTS=${SRUN_OPTS:-}
 DDP="source $REPO/scripts/export_ddp.sh"
 # export_ddp.sh points every step at the allocation's first node; one chain per node needs its own rendezvous.
 [ -n "$SRUN_OPTS" ] && DDP+='; export MASTER_ADDR=$(hostname) MASTER_PORT=$((29500 + SLURM_JOB_ID % 5000 + SLURM_STEP_ID % 1000))'
+FLOAT_KD="--distill --teacher-labels-dir $TEACHER --teacher-tag fine_tune_top_l $KD"
+[ -n "${NO_KD:-}" ] && FLOAT_KD=""
+[ -n "${SEED:-}" ] && FLOAT_KD+=" --seed $SEED"
+MODEL="--arch deep-sets --size $SIZE --act-layer relu --deepsets-fixed-n $N --num-classes 2"
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOGS/${FLOAT_TAG}.log"; }
 
 log "job $SLURM_JOB_ID size=$SIZE n=$N float=$FLOAT_TAG qat=$QAT_TAG repo=$REPO base=$BASE"
 if [ ! -f "$CKPT/training_${FLOAT_TAG}.json" ]; then
-    log "[1/3] float KD $EPOCH epochs"
+    log "[1/3] float ${NO_KD:+from-scratch }$EPOCH epochs: $FLOAT_KD"
     srun -l -u $SRUN_OPTS bash -c "$DDP; omnilearned train -o $CKPT --save-tag $FLOAT_TAG \
-        --dataset top --mode classifier --num-classes 2 --path $DATA --arch deep-sets \
-        --size $SIZE --act-layer relu --deepsets-fixed-n $N --batch 128 \
-        --iterations 1000 --epoch $EPOCH --lr 5e-4 --wd 0.5 --num-workers 4 --distill --teacher-labels-dir $TEACHER \
-        --teacher-tag fine_tune_top_l $KD --resuming" || { log "float KD failed"; exit 1; }
+        --dataset top --mode classifier --path $DATA $MODEL --batch 128 \
+        --iterations 1000 --epoch $EPOCH --lr 5e-4 --wd 0.5 --num-workers 4 $FLOAT_KD --resuming" \
+        || { log "float KD failed"; exit 1; }
+fi
+if [ -n "${SCORES:-}" ] && ! ls "$BASE/eval/ps/outputs_${FLOAT_TAG}_top_test_rank"*.npz >/dev/null 2>&1; then
+    log "float test scores -> $BASE/eval/ps/"
+    srun -u $SRUN_OPTS -n 1 -c 32 bash -c "$DDP; omnilearned evaluate -i $CKPT -o $BASE/eval/ps/ --save-tag $FLOAT_TAG \
+        --dataset top --path $DATA $MODEL --batch 512 --num-workers 8 --dataset-type test" || log "float eval failed"
 fi
 
 if [ ! -f "$LOGS/${QAT_TAG}.done" ]; then
@@ -82,6 +94,6 @@ log "done: $BASE/qonnx/fpga/${QAT_TAG}_clean.onnx"
 if [ -n "${EVAL:-}" ]; then
     log "[4/4] test-set eval"
     srun -u $SRUN_OPTS -n 1 -c 32 bash -c "$DDP; python tools/quantize/qat_deepsets_eval.py --tag $QAT_TAG \
-        --checkpoint-dir $CKPT --data-path $DATA" > "$LOGS/${QAT_TAG}_eval.txt" 2>&1 || log "eval failed"
+        --checkpoint-dir $CKPT --data-path $DATA ${SCORES:+--save-scores $BASE/eval/ps/}" > "$LOGS/${QAT_TAG}_eval.txt" 2>&1 || log "eval failed"
     log "eval $QAT_TAG: $(grep -E 'Accuracy|AUC|1/FPR' "$LOGS/${QAT_TAG}_eval.txt" | tr -s ' ' | paste -sd ';')"
 fi

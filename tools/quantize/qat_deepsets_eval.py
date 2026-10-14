@@ -12,6 +12,9 @@ Usage:
 """
 
 import argparse
+import os
+
+import numpy as np
 
 import torch
 from sklearn.metrics import roc_auc_score, roc_curve
@@ -46,6 +49,8 @@ def main():
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--data-path", default=DATA_PATH, help="dataset root holding top/")
+    ap.add_argument("--save-scores", metavar="DIR", help="also write DIR/outputs_<tag>_top_test_rank0.npz "
+                    "(prediction, pid), the format omnilearned evaluate writes, for ROC plots")
     args = ap.parse_args()
 
     local_rank, rank, size = ddp_setup()
@@ -72,6 +77,11 @@ def main():
             labels.append(y.cpu())
     preds = torch.cat(preds).numpy()
     labels = torch.cat(labels).numpy()
+
+    if args.save_scores:
+        out = os.path.join(args.save_scores, f"outputs_{args.tag}_top_test_rank0.npz")
+        np.savez(out, prediction=preds, pid=labels)
+        print(f"Saved scores: {out}")
 
     acc, auc, rej = compute_metrics(preds, labels)
     print(f"\n=== {args.tag} (full-quant QAT) ===")
