@@ -20,7 +20,10 @@
 #             (scripts/fullquant_multi.sh); each step then rendezvouses on its own node
 #   EVAL=1    stage 4: qat_deepsets_eval.py on the full test set -> $LOGS/${QAT_TAG}_eval.txt
 #   NO_KD=1   float stage trains from scratch on truth labels (no --distill); QAT still distills
-#   SEED=N    --seed N for the float stage (default unseeded)
+#   SEED=N    --seed N for the float stage, or for QAT with QAT_SCRATCH=1 (default unseeded)
+#   QAT_SCRATCH=1  no float stage: QAT from random init on truth labels (qat_deepsets.py --from-scratch
+#             --no-distill), a no-KD baseline. Needs QAT_TAG; FLOAT_TAG defaults to it (only names the log).
+#             Set the schedule in QAT_ARGS, e.g. "--epochs 100 --lr 5e-4 --warmup-epoch 0"
 #   SCORES=1  per-jet test scores for ROC plots in $BASE/eval/ps/: float eval after stage 1, and
 #             qat_deepsets_eval.py --save-scores in stage 4 (needs EVAL=1)
 #SBATCH -A m3246
@@ -37,6 +40,7 @@ set -uo pipefail
 : "${SIZE:?set SIZE, e.g. SIZE=d12p2r1m1}"
 : "${N:?set N, the fixed constituent count, e.g. N=16}"
 EPOCH=${EPOCH:-50}
+[ -n "${QAT_SCRATCH:-}" ] && FLOAT_TAG=${FLOAT_TAG:-${QAT_TAG:?QAT_SCRATCH=1 needs QAT_TAG}}
 FLOAT_TAG=${FLOAT_TAG:-deepsets_${SIZE}_n${N}_e${EPOCH}}
 QAT_TAG=${QAT_TAG:-qat_${FLOAT_TAG}_8bit_fullQuant}
 REPO=$PWD
@@ -64,25 +68,27 @@ MODEL="--arch deep-sets --size $SIZE --act-layer relu --deepsets-fixed-n $N --nu
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOGS/${FLOAT_TAG}.log"; }
 
 log "job $SLURM_JOB_ID size=$SIZE n=$N float=$FLOAT_TAG qat=$QAT_TAG repo=$REPO base=$BASE"
-if [ ! -f "$CKPT/training_${FLOAT_TAG}.json" ]; then
+if [ -z "${QAT_SCRATCH:-}" ] && [ ! -f "$CKPT/training_${FLOAT_TAG}.json" ]; then
     log "[1/3] float ${NO_KD:+from-scratch }$EPOCH epochs: $FLOAT_KD"
     srun -l -u $SRUN_OPTS bash -c "$DDP; omnilearned train -o $CKPT --save-tag $FLOAT_TAG \
         --dataset top --mode classifier --path $DATA $MODEL --batch 128 \
         --iterations 1000 --epoch $EPOCH --lr 5e-4 --wd 0.5 --num-workers 4 $FLOAT_KD --resuming" \
         || { log "float KD failed"; exit 1; }
 fi
-if [ -n "${SCORES:-}" ] && ! ls "$BASE/eval/ps/outputs_${FLOAT_TAG}_top_test_rank"*.npz >/dev/null 2>&1; then
+if [ -z "${QAT_SCRATCH:-}" ] && [ -n "${SCORES:-}" ] && ! ls "$BASE/eval/ps/outputs_${FLOAT_TAG}_top_test_rank"*.npz >/dev/null 2>&1; then
     log "float test scores -> $BASE/eval/ps/"
     srun -u $SRUN_OPTS -n 1 -c 32 bash -c "$DDP; omnilearned evaluate -i $CKPT -o $BASE/eval/ps/ --save-tag $FLOAT_TAG \
         --dataset top --path $DATA $MODEL --batch 512 --num-workers 8 --dataset-type test" || log "float eval failed"
 fi
 
 if [ ! -f "$LOGS/${QAT_TAG}.done" ]; then
-    log "[2/3] full-quant QAT"
-    srun -l -u $SRUN_OPTS bash -c "$DDP; python tools/quantize/qat_deepsets.py --tag $FLOAT_TAG \
+    QAT_INIT="--tag $FLOAT_TAG --teacher-dir $TEACHER --teacher-tag fine_tune_top_l $KD"
+    [ -n "${QAT_SCRATCH:-}" ] && QAT_INIT="--from-scratch --no-distill --size $SIZE --deepsets-fixed-n $N \
+        --act-layer relu ${SEED:+--seed $SEED}"
+    log "[2/3] full-quant QAT${QAT_SCRATCH:+ from scratch, no KD}"
+    srun -l -u $SRUN_OPTS bash -c "$DDP; python tools/quantize/qat_deepsets.py $QAT_INIT \
         --save-tag $QAT_TAG --init-dir $CKPT --output-dir $CKPT --epochs 15 --warmup-epoch 1 \
-        --lr 5e-5 --wd 0.5 --batch 128 --iterations 1000 --num-workers 4 --teacher-dir $TEACHER \
-        --teacher-tag fine_tune_top_l $KD --data-path $DATA ${QAT_ARGS:-}" || { log "QAT failed"; exit 1; }
+        --lr 5e-5 --wd 0.5 --batch 128 --iterations 1000 --num-workers 4 --data-path $DATA ${QAT_ARGS:-}" || { log "QAT failed"; exit 1; }
     touch "$LOGS/${QAT_TAG}.done"
 fi
 

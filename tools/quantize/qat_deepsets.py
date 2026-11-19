@@ -59,6 +59,11 @@ Older float checkpoint without arch_config (the distillnet student, N = 64):
         --size distillnet --deepsets-fixed-n 64 \
         --save-tag qat_top_deepsets_distillnet_fpga_a05_T4_8bit_fullQuant
 
+From scratch, no float checkpoint and no teacher (a baseline; schedule as the float stage):
+    python tools/quantize/qat_deepsets.py --from-scratch --no-distill --seed 1 \
+        --size d18p2r1m1 --deepsets-fixed-n 16 --epochs 100 --lr 5e-4 --warmup-epoch 0 \
+        --save-tag qat_ps_d18p2r1m1_n16_qs100_s1_stk
+
 Multi-GPU (one node, 4 GPUs, ~1 h for d12 N=16) from the repo root, inside an
 allocation such as
 salloc -C gpu -q interactive -t 240 --nodes 1 --ntasks-per-node 4 --gpus-per-node 4 -A m3246:
@@ -339,7 +344,8 @@ def prune_hidden_linears(model, optimizer, frac, ramp_steps, embed_frac=None, rh
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", required=True, help="float checkpoint to start from: <init-dir>/best_model_<tag>.pt")
+    ap.add_argument("--tag", help="float checkpoint to start from: <init-dir>/best_model_<tag>.pt "
+                    "(not with --from-scratch)")
     ap.add_argument("--save-tag", required=True, help="tag of the QAT checkpoint written to <output-dir>")
     ap.add_argument("--init-dir", default=CHECKPOINT_DIR, help="dir holding the float --tag checkpoint")
     ap.add_argument("--output-dir", default=CHECKPOINT_DIR, help="dir the QAT checkpoint is written to")
@@ -363,6 +369,11 @@ def main():
     ap.add_argument("--distill-alpha", type=float, default=0.5)
     ap.add_argument("--distill-beta", type=float, default=0.5)
     ap.add_argument("--distill-t", type=float, default=4.0)
+    ap.add_argument("--from-scratch", action="store_true",
+                    help="random init instead of a float checkpoint; shape from --size/--act-layer/--deepsets-fixed-n")
+    ap.add_argument("--no-distill", action="store_true",
+                    help="train on truth labels only (no teacher logits loaded)")
+    ap.add_argument("--seed", type=int, default=-1, help="seed (+rank) for init and data order; -1 = unseeded")
     # Only for float checkpoints saved before arch_config existed; otherwise the shape comes from the checkpoint.
     ap.add_argument("--size", help="e.g. distillnet, d12p2r1m1 (old float checkpoints only)")
     ap.add_argument("--act-layer", default="relu", choices=sorted(ACT_LAYERS),
@@ -383,19 +394,37 @@ def main():
                     help="with --prune: the rho Linears' fraction instead (0 = keep them dense; default --prune)")
     args = ap.parse_args()
 
+    if args.from_scratch == bool(args.tag):
+        ap.error("pass exactly one of --tag and --from-scratch")
+    if args.from_scratch and not (args.size and args.deepsets_fixed_n):
+        ap.error("--from-scratch needs --size and --deepsets-fixed-n")
+
     local_rank, rank, size = ddp_setup()
 
-    shape = read_arch_config(args.init_dir, args.tag)
+    if args.seed >= 0:
+        # As train.py: rank offset, so DDP replicas still draw different data.
+        import random
+        import numpy as np
+        s = args.seed + rank
+        random.seed(s)
+        np.random.seed(s)
+        torch.manual_seed(s)
+        torch.cuda.manual_seed_all(s)
+
+    shape = None if args.from_scratch else read_arch_config(args.init_dir, args.tag)
     if shape is None:
         if args.size is None:
             ap.error(f"{args.tag} has no arch_config: pass --size, --act-layer and --deepsets-fixed-n")
         shape = {"size": args.size, "act_layer": args.act_layer, "fixed_n": args.deepsets_fixed_n}
     model = build_deepsets(shape)
-    restore_checkpoint(model, args.init_dir, get_checkpoint_name(args.tag), local_rank, is_main_node=is_master_node())
+    if not args.from_scratch:
+        restore_checkpoint(model, args.init_dir, get_checkpoint_name(args.tag), local_rank,
+                           is_main_node=is_master_node())
     n_params = sum(p.numel() for p in model.parameters())
     if is_master_node():
-        print(f"Warm-started from {args.tag} (size={shape['size']} act={shape['act_layer']} "
-              f"fixed_n={shape['fixed_n']}): {n_params:,} params")
+        start = "Random init (from scratch)" if args.from_scratch else f"Warm-started from {args.tag}"
+        print(f"{start} (size={shape['size']} act={shape['act_layer']} "
+              f"fixed_n={shape['fixed_n']}): {n_params:,} params; distill={not args.no_distill} seed={args.seed}")
 
     fold_dyt_gamma(model)
     w_bits, a_bits = args.w_bits or args.bits, args.a_bits or args.bits
@@ -436,6 +465,9 @@ def main():
             "prune": args.prune,  # hidden-Linear weight sparsity (record only; the zeros are in the weights)
             "prune_embed": args.prune if args.prune_embed is None else args.prune_embed,  # embed fc2's sparsity
             "prune_rho": args.prune if args.prune_rho is None else args.prune_rho,  # rho Linears' sparsity
+            "init": "scratch" if args.from_scratch else args.tag,  # float checkpoint QAT started from
+            "distill": not args.no_distill,
+            "seed": args.seed,  # -1 = unseeded
         },
     }
     if is_master_node():
@@ -443,15 +475,16 @@ def main():
         print(f"Wrapped {n_qlin} nn.Linear layers as Brevitas QuantLinear (w{w_bits} a{a_bits} in{in_bits} "
               f"tanh{tanh_bits} res{args.res_bits} {args.round})")
 
+    teacher = {} if args.no_distill else {"teacher_labels_dir": args.teacher_dir, "teacher_tag": args.teacher_tag}
     train_loader = load_data(
         "top", dataset_type="train", use_cond=True, path=args.data_path, batch=args.batch,
         num_workers=args.num_workers, rank=rank, size=size, mode="classifier",
-        teacher_labels_dir=args.teacher_dir, teacher_tag=args.teacher_tag,
+        **teacher,
     )
     val_loader = load_data(
         "top", dataset_type="val", use_cond=True, path=args.data_path, batch=args.batch,
         num_workers=args.num_workers, rank=rank, size=size, mode="classifier",
-        teacher_labels_dir=args.teacher_dir, teacher_tag=args.teacher_tag,
+        **teacher,
     )
 
     param_groups = get_param_groups(model, args.wd, args.lr, lr_factor=1.0, fine_tune=False)
@@ -489,7 +522,7 @@ def main():
         save_tag=args.save_tag,
         iterations_per_epoch=train_steps,
         ema_model=None,
-        distill=True,
+        distill=not args.no_distill,
         distill_alpha=args.distill_alpha,
         distill_beta=args.distill_beta,
         distill_T=args.distill_t,
