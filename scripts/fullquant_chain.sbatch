@@ -24,6 +24,7 @@
 #   QAT_SCRATCH=1  no float stage: QAT from random init on truth labels (qat_deepsets.py --from-scratch
 #             --no-distill), a no-KD baseline. Needs QAT_TAG; FLOAT_TAG defaults to it (only names the log).
 #             Set the schedule in QAT_ARGS, e.g. "--epochs 100 --lr 5e-4 --warmup-epoch 0"
+#   SCRATCH_KD=1  with QAT_SCRATCH=1: distill from the teacher (same KD as the QAT stage) instead of --no-distill
 #   SCORES=1  per-jet test scores for ROC plots in $BASE/eval/ps/: float eval after stage 1, and
 #             qat_deepsets_eval.py --save-scores in stage 4 (needs EVAL=1)
 #SBATCH -A m3246
@@ -83,9 +84,11 @@ fi
 
 if [ ! -f "$LOGS/${QAT_TAG}.done" ]; then
     QAT_INIT="--tag $FLOAT_TAG --teacher-dir $TEACHER --teacher-tag fine_tune_top_l $KD"
-    [ -n "${QAT_SCRATCH:-}" ] && QAT_INIT="--from-scratch --no-distill --size $SIZE --deepsets-fixed-n $N \
+    SCRATCH_LOSS="--no-distill"; SCRATCH_DESC="no KD"
+    [ -n "${SCRATCH_KD:-}" ] && SCRATCH_LOSS="--teacher-dir $TEACHER --teacher-tag fine_tune_top_l $KD" SCRATCH_DESC="KD"
+    [ -n "${QAT_SCRATCH:-}" ] && QAT_INIT="--from-scratch $SCRATCH_LOSS --size $SIZE --deepsets-fixed-n $N \
         --act-layer relu ${SEED:+--seed $SEED}"
-    log "[2/3] full-quant QAT${QAT_SCRATCH:+ from scratch, no KD}"
+    log "[2/3] full-quant QAT${QAT_SCRATCH:+ from scratch, $SCRATCH_DESC}"
     srun -l -u $SRUN_OPTS bash -c "$DDP; python tools/quantize/qat_deepsets.py $QAT_INIT \
         --save-tag $QAT_TAG --init-dir $CKPT --output-dir $CKPT --epochs 15 --warmup-epoch 1 \
         --lr 5e-5 --wd 0.5 --batch 128 --iterations 1000 --num-workers 4 --data-path $DATA ${QAT_ARGS:-}" || { log "QAT failed"; exit 1; }
